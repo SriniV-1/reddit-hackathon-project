@@ -479,12 +479,32 @@ async function boot(): Promise<void> {
     state.init = data;
     state.pristineGrid = data.board.grid;
     state.phase = 'title';
+    maybeAutoStart();
   } catch (err) {
     state.error = `Couldn't reach the harbor (${String(err)}). Refresh to retry.`;
     state.phase = 'title';
   }
 }
 void boot();
+
+/**
+ * Dev-only screenshot harness (localhost playtest only): ?auto=1&elapsed=12
+ * jumps straight into a practice run with the flood clock pre-advanced, so
+ * headless-browser screenshots can capture any moment of the sink. Inert in
+ * production — it requires a localhost hostname.
+ */
+function maybeAutoStart(): void {
+  if (window.location.hostname !== 'localhost') return;
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('auto') !== '1') return;
+  startRun(true);
+  chooseRelic((params.get('relic') as RelicId | null) ?? 'compass');
+  const elapsed = Number(params.get('elapsed') ?? 0);
+  state.runStart = performance.now() - elapsed * 1000;
+  state.playerR = Number(params.get('r') ?? 3);
+  state.playerC = Number(params.get('c') ?? 3);
+  state.nextStruggleAt = Number.MAX_SAFE_INTEGER; // hold the pose for the camera
+}
 
 function startRun(practice: boolean): void {
   if (!state.pristineGrid) return;
@@ -1114,17 +1134,22 @@ function drawGame(now: number): void {
 
   drawHud(now);
 
+  // A small ribbon instead of a screen-wide watermark — labels the run
+  // without wrecking the scene.
   if (state.practice && state.phase === 'playing') {
     ctx.save();
-    ctx.globalAlpha = 0.14;
-    ctx.fillStyle = COLORS.hud;
-    ctx.font = `800 ${Math.floor(VIEW_W * 0.13)}px sans-serif`;
+    const rw = VIEW_W * 0.22;
+    const rh = VIEW_W * 0.05;
+    const rx = VIEW_W - rw - RAIL;
+    const ry = HUD_H + RAIL * 0.6;
+    ctx.fillStyle = 'rgba(255, 210, 63, 0.85)';
+    roundRect(rx, ry, rw, rh, rh / 2);
+    ctx.fill();
+    ctx.fillStyle = '#2b1206';
+    ctx.font = `800 ${Math.floor(rh * 0.55)}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    const mid = rcToXY(4, 4);
-    ctx.translate(mid.x, mid.y);
-    ctx.rotate(-0.35);
-    ctx.fillText('PRACTICE', 0, 0);
+    ctx.fillText('PRACTICE', rx + rw / 2, ry + rh / 2 + 0.5);
     ctx.restore();
   }
 }
@@ -1554,6 +1579,13 @@ function drawPlayer(now: number): void {
   ctx.translate(x, y);
   ctx.scale(k, k);
 
+  // Always-on rim light so the survivor never disappears into the water,
+  // plus the deep-water glow that ramps as the world darkens.
+  const rim = ctx.createRadialGradient(0, -TILE * 0.1, TILE * 0.08, 0, -TILE * 0.1, TILE * 0.42);
+  rim.addColorStop(0, 'rgba(255, 255, 255, 0.22)');
+  rim.addColorStop(1, 'rgba(255, 255, 255, 0)');
+  ctx.fillStyle = rim;
+  ctx.fillRect(-TILE * 0.42, -TILE * 0.52, TILE * 0.84, TILE * 0.84);
   glowHalo(now, '47, 168, 255', TILE * 0.65, 0.55); // find yourself in the dark
   shadow(TILE * 0.2 * (1 - hop / TILE));
   ctx.translate(0, -hop);
@@ -1604,9 +1636,22 @@ function drawPlayer(now: number): void {
     ctx.scale(k, k);
     const yDeckLocal = TILE * 0.3; // the deck plane at the feet
     const yLine = yDeckLocal - h * TILE; // local waterline height
-    // The water column in front of the body.
-    ctx.fillStyle = 'rgba(13, 74, 110, 0.55)';
-    ctx.fillRect(-TILE * 0.46, yLine, TILE * 0.92, yDeckLocal - yLine + TILE * 0.12);
+    // Soft water tint over the submerged part of the body — a radial blob
+    // that fades at the edges (no hard box), just enough to sink the sprite.
+    const midY = (yLine + yDeckLocal) / 2;
+    const half = (yDeckLocal - yLine) / 2 + TILE * 0.08;
+    ctx.save();
+    ctx.translate(0, midY);
+    ctx.scale(1, Math.max(0.2, half / (TILE * 0.5)));
+    const blob = ctx.createRadialGradient(0, 0, TILE * 0.08, 0, 0, TILE * 0.5);
+    blob.addColorStop(0, 'rgba(16, 90, 132, 0.55)');
+    blob.addColorStop(0.75, 'rgba(16, 90, 132, 0.35)');
+    blob.addColorStop(1, 'rgba(16, 90, 132, 0)');
+    ctx.fillStyle = blob;
+    ctx.beginPath();
+    ctx.arc(0, 0, TILE * 0.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
     // Foam lapping around them at the waterline.
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
     ctx.lineWidth = Math.max(1.5, TILE * 0.035);
@@ -1725,8 +1770,8 @@ function mixRgba(
   return `rgba(${r}, ${g}, ${bl}, ${alpha.toFixed(3)})`;
 }
 
-const WATER_NEAR: readonly [number, number, number] = [24, 118, 160]; // lagoon
-const WATER_FAR: readonly [number, number, number] = [4, 34, 58]; // abyss
+const WATER_NEAR: readonly [number, number, number] = [36, 152, 196]; // lagoon
+const WATER_FAR: readonly [number, number, number] = [6, 44, 76]; // abyss
 
 /**
  * One row's slice of the global water surface. Called from
@@ -1739,7 +1784,9 @@ function drawWaterRowStrip(r: number, now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
 
-  const alpha = 0.16 + 0.55 * Math.min(1, h / WATER_HEAD);
+  // Starts as a barely-there film so the wood still reads early game, then
+  // deepens on a curve — the color change IS the story of the sink.
+  const alpha = 0.05 + 0.6 * Math.pow(Math.min(1, h / WATER_HEAD), 1.15);
   const S = 4;
   for (let i = 0; i < S; i++) {
     const rr0 = r + i / S;
@@ -1823,11 +1870,32 @@ function drawFloodExtras(now: number): void {
   const ySurf = liveSurfaceY(BOARD_SIZE, now);
   const yDeckNear = BOARD_Y + BOARD_H + RAIL;
   const wall = ctx.createLinearGradient(0, ySurf, 0, yDeckNear);
-  wall.addColorStop(0, 'rgba(64, 158, 205, 0.9)');
-  wall.addColorStop(0.25, 'rgba(24, 100, 142, 0.88)');
-  wall.addColorStop(1, 'rgba(3, 24, 42, 0.95)');
+  wall.addColorStop(0, 'rgba(94, 205, 255, 0.95)');
+  wall.addColorStop(0.3, 'rgba(32, 138, 190, 0.92)');
+  wall.addColorStop(1, 'rgba(4, 40, 70, 0.96)');
   ctx.fillStyle = wall;
   ctx.fillRect(xl, ySurf, xr - xl, Math.max(0, yDeckNear - ySurf));
+
+  // Light streaks shimmering inside the wall — the fish-tank cross-section.
+  if (yDeckNear - ySurf > 6) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(xl, ySurf, xr - xl, yDeckNear - ySurf);
+    ctx.clip();
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < 9; i++) {
+      const sx = xl + ((i + 0.5) / 9) * (xr - xl) + Math.sin(now / 700 + i * 2.4) * TILE * 0.12;
+      const sw = TILE * (0.03 + 0.03 * hash01(i + 77));
+      const sa = 0.06 + 0.05 * Math.sin(now / 500 + i * 1.3);
+      if (sa <= 0.02) continue;
+      const sg = ctx.createLinearGradient(0, ySurf, 0, yDeckNear);
+      sg.addColorStop(0, `rgba(180, 235, 255, ${sa.toFixed(3)})`);
+      sg.addColorStop(1, 'rgba(180, 235, 255, 0)');
+      ctx.fillStyle = sg;
+      ctx.fillRect(sx - sw / 2, ySurf, sw, yDeckNear - ySurf);
+    }
+    ctx.restore();
+  }
 
   // --- Meniscus: the glowing waterline you watch climb ---------------------
   const meniscus = (y0: number, x0: number, x1: number, strength: number): void => {
