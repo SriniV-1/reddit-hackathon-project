@@ -10,6 +10,8 @@
     "build:server": "vite build --config vite.server.config.ts",
     "build": "npm run build:client && npm run build:server",
     "dev": "devvit playtest",
+    "playtest:local": "npm run build:client && node scripts/local-playtest.mjs",
+    "test:boards": "node --input-type=module -e \"import { generateDailyBoard, isWinnable } from './scripts/local-playtest.mjs'; let bad = 0; const start = new Date('2026-01-01T00:00:00Z'); for (let d = 0; d < 1095; d++) { const date = new Date(start.getTime() + d * 864e5).toISOString().slice(0, 10); if (!isWinnable(generateDailyBoard(date).grid)) bad++; } console.log('1095 daily boards checked, unwinnable:', bad); process.exit(bad === 0 ? 0 : 1);\"",
     "deploy": "npm run build && devvit upload",
     "launch": "npm run build && devvit publish",
     "type-check": "tsc --noEmit"

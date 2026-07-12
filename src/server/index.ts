@@ -2,66 +2,90 @@
  * ============================================================================
  *  LAST VOYAGE — Devvit Web server
  * ============================================================================
- *  A tiny Express-style backend that runs on Reddit's Devvit Web runtime.
+ *  Express-style backend running on Reddit's Devvit Web runtime (@devvit/web).
  *
- *  It exposes three routes the canvas client talks to over `fetch()`:
- *    GET  /api/getDailyBoard      -> deterministic daily 8x8 board (same for
- *                                    everyone on a given calendar day)
- *    POST /api/submitRun          -> record a finished run once per user/day and
- *                                    add the score to the subreddit's "faction"
+ *  Routes (all called from the canvas client via fetch()):
+ *    GET  /api/init            -> everything the client needs to boot: today's
+ *                                 board, username, streak, personal best,
+ *                                 played-today flag, and today's leaderboard
+ *    GET  /api/getDailyBoard   -> just the deterministic daily board
+ *    POST /api/submitRun       -> record a run (once per user per day), update
+ *                                 streak / personal best / daily leaderboard /
+ *                                 subreddit faction total
  *    POST /internal/menu/create-post -> moderator menu action to spawn a post
  *
- *  Everything the game "looks like" (ship, water, pearls, sharks) is drawn on
- *  the client. The server only deals in data.
+ *  Retention design (the "hook"):
+ *    • The board is seeded by the UTC date — everyone sails the SAME ship each
+ *      day, so scores are comparable and tomorrow is always a fresh race.
+ *    • One scored run per day makes the attempt precious (wordle-style).
+ *    • Streaks reward consecutive-day play; leaderboards reward mastery;
+ *      faction totals give your whole subreddit a shared goal.
  * ============================================================================
  */
 
 import express from 'express';
-// The Devvit runtime injects these. Depending on your @devvit/web version the
-// same symbols may live at '@devvit/server' / '@devvit/redis' / '@devvit/reddit'
-// — consolidate the import line if your CLI complains.
 import {
+  context,
   createServer,
   getServerPort,
-  context,
-  redis,
   reddit,
+  redis,
 } from '@devvit/web/server';
 
 // ---------------------------------------------------------------------------
-// Shared board vocabulary. Kept in sync (by hand) with the client's copy so the
-// two independent bundles agree on what each tile means.
+// Board vocabulary — mirrored by hand in src/client/app.ts.
 // ---------------------------------------------------------------------------
-export type Tile =
+export type TileKind =
   | 'empty' // open, walkable deck
-  | 'pearl' // +points, spawns a particle burst on the client
-  | 'crate' // supply crate: bigger points bonus
-  | 'shark' // hazard: costs HP
+  | 'pearl' // +points; particle burst on pickup
+  | 'crate' // supply crate: bigger bonus
+  | 'shark' // hazard: costs HP (unless Harpoon)
   | 'breach' // hull breach / whirlpool: costs HP
   | 'lifeboat'; // the goal at [7,7]
 
 export interface DailyBoard {
-  date: string; // YYYY-MM-DD (the seed)
+  date: string; // YYYY-MM-DD (UTC) — the seed
   size: number; // always 8
-  grid: Tile[][]; // grid[row][col]
+  grid: TileKind[][]; // grid[row][col]
 }
 
 const BOARD_SIZE = 8;
-const START: readonly [number, number] = [0, 0]; // player spawn (row, col)
-const LIFEBOAT: readonly [number, number] = [7, 7]; // the exit
+const START: readonly [number, number] = [0, 0];
+const LIFEBOAT: readonly [number, number] = [7, 7];
 
-// How many of each entity to scatter across the deck each day.
-const SPAWN_COUNTS = {
-  pearl: 10,
-  crate: 2,
-  shark: 5,
-  breach: 3,
+// Daily entity counts (spec: 10 collectibles, 2 chests, 5 monsters, 3 traps).
+const SPAWN_COUNTS = { pearl: 10, crate: 2, shark: 5, breach: 3 } as const;
+
+// The lifeboat is 14 orthogonal moves from spawn (Manhattan [0,0]→[7,7]).
+// The move budget is simulation-tuned (see README): 18 gives ~4 moves of
+// slack — enough to detour for 2-3 treasures, never enough to loot the whole
+// deck. Kept in sync with the client by hand.
+const BASE_MAX_STEPS = 18;
+
+// Hard ceiling on a legitimate score, used to clamp tampered submissions:
+// 10 pearls×2 (compass) + 2 crates×50 + 5 sharks×25 (harpoon) + 100 lifeboat
+// + 8 leftover moves×5 ≈ 565. Round up generously.
+const MAX_PLAUSIBLE_SCORE = 1000;
+
+// ---------------------------------------------------------------------------
+// Redis key helpers. Everything is namespaced under "lv:".
+// ---------------------------------------------------------------------------
+const keys = {
+  /** "played today" dedupe flag, one per user per day */
+  played: (date: string, userId: string) => `lv:played:${date}:${userId}`,
+  /** per-day leaderboard (sorted set: member = username, score = run score) */
+  daily: (date: string) => `lv:lb:${date}`,
+  /** global cross-subreddit faction totals (sorted set: member = subreddit) */
+  factions: 'lv:factions',
+  /** per-user personal best (string int) */
+  best: (userId: string) => `lv:best:${userId}`,
+  /** per-user streak state (JSON: { count, last }) */
+  streak: (userId: string) => `lv:streak:${userId}`,
 } as const;
 
 // ---------------------------------------------------------------------------
-// Deterministic RNG. We hash the date string into a 32-bit seed and feed it to
-// mulberry32 — a tiny, fast, well-distributed PRNG. Same date => same board for
-// every player, which is what makes the daily leaderboard fair.
+// Deterministic RNG: hash the date string to a 32-bit seed, feed mulberry32.
+// Same date => same board for every player => a fair daily race.
 // ---------------------------------------------------------------------------
 function hashStringToSeed(str: string): number {
   let h = 1779033703 ^ str.length;
@@ -83,28 +107,70 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-/** Today's date in UTC as YYYY-MM-DD — the daily seed. */
+/** Today's UTC date as YYYY-MM-DD — the daily seed. */
 function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** Yesterday's UTC date as YYYY-MM-DD — used for streak continuity. */
+function yesterdayKey(): string {
+  return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
 /**
- * Build the deterministic board for a given date.
- *
- * Strategy: start with an all-empty grid, reserve the spawn + lifeboat tiles,
- * then seed-shuffle every remaining coordinate and deal entities off the top of
- * the deck. Because the shuffle is deterministic, the layout is identical for
- * everyone playing on `date`.
+ * True if a hazard-free path exists from START to LIFEBOAT within the move
+ * budget. Plain BFS over the 4-connected grid, skipping sharks and breaches.
+ * (Players CAN tank hazards with HP, so this is a conservative check — if a
+ * clean path exists the board is comfortably winnable.)
+ */
+function isWinnable(grid: TileKind[][]): boolean {
+  const blocked = (t: TileKind): boolean => t === 'shark' || t === 'breach';
+  const dist: number[][] = grid.map((row) => row.map(() => -1));
+  dist[START[0]][START[1]] = 0;
+  const queue: Array<[number, number]> = [[START[0], START[1]]];
+  while (queue.length > 0) {
+    const [r, c] = queue.shift()!;
+    if (r === LIFEBOAT[0] && c === LIFEBOAT[1]) return dist[r][c] <= BASE_MAX_STEPS;
+    for (const [dr, dc] of [[-1, 0], [1, 0], [0, -1], [0, 1]] as const) {
+      const nr = r + dr;
+      const nc = c + dc;
+      if (nr < 0 || nr >= BOARD_SIZE || nc < 0 || nc >= BOARD_SIZE) continue;
+      if (dist[nr][nc] !== -1 || blocked(grid[nr][nc])) continue;
+      dist[nr][nc] = dist[r][c] + 1;
+      queue.push([nr, nc]);
+    }
+  }
+  return false;
+}
+
+/**
+ * The deterministic board for a date, GUARANTEED winnable: generate from the
+ * date seed, and if the layout walls off the lifeboat, deterministically
+ * re-roll with "date#1", "date#2", … — still identical for every player.
  */
 function generateDailyBoard(date: string): DailyBoard {
-  const rand = mulberry32(hashStringToSeed(date));
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const seed = attempt === 0 ? date : `${date}#${attempt}`;
+    const board = generateBoardFromSeed(date, seed);
+    if (isWinnable(board.grid)) return board;
+  }
+  // Statistically unreachable (8 hazards on 64 tiles almost never wall off a
+  // 20-step path 100 times in a row), but never leave the player boardless.
+  return generateBoardFromSeed(date, date);
+}
 
-  // 1. Empty deck.
-  const grid: Tile[][] = Array.from({ length: BOARD_SIZE }, () =>
-    Array.from({ length: BOARD_SIZE }, () => 'empty' as Tile)
+/**
+ * Build one board candidate: start empty, reserve spawn + lifeboat,
+ * seed-shuffle the remaining 62 cells (Fisher–Yates), then deal entities off
+ * the top of the shuffled deck in a fixed order.
+ */
+function generateBoardFromSeed(date: string, seed: string): DailyBoard {
+  const rand = mulberry32(hashStringToSeed(seed));
+
+  const grid: TileKind[][] = Array.from({ length: BOARD_SIZE }, () =>
+    Array.from({ length: BOARD_SIZE }, () => 'empty' as TileKind)
   );
 
-  // 2. Collect every placeable cell except the reserved start + lifeboat.
   const cells: Array<[number, number]> = [];
   for (let r = 0; r < BOARD_SIZE; r++) {
     for (let c = 0; c < BOARD_SIZE; c++) {
@@ -114,15 +180,13 @@ function generateDailyBoard(date: string): DailyBoard {
     }
   }
 
-  // 3. Fisher–Yates shuffle driven by the seeded RNG.
   for (let i = cells.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
     [cells[i], cells[j]] = [cells[j], cells[i]];
   }
 
-  // 4. Deal entities off the shuffled deck in a fixed order.
   let cursor = 0;
-  const deal = (tile: Tile, count: number) => {
+  const deal = (tile: TileKind, count: number): void => {
     for (let n = 0; n < count; n++) {
       const [r, c] = cells[cursor++];
       grid[r][c] = tile;
@@ -133,10 +197,47 @@ function generateDailyBoard(date: string): DailyBoard {
   deal('shark', SPAWN_COUNTS.shark);
   deal('breach', SPAWN_COUNTS.breach);
 
-  // 5. Plant the lifeboat at the exit.
   grid[LIFEBOAT[0]][LIFEBOAT[1]] = 'lifeboat';
 
   return { date, size: BOARD_SIZE, grid };
+}
+
+// ---------------------------------------------------------------------------
+// Small data helpers shared by /api/init and /api/submitRun.
+// ---------------------------------------------------------------------------
+interface StreakState {
+  count: number;
+  last: string; // YYYY-MM-DD of the last scored run
+}
+
+async function readStreak(userId: string): Promise<StreakState> {
+  const raw = await redis.get(keys.streak(userId));
+  if (!raw) return { count: 0, last: '' };
+  try {
+    const parsed = JSON.parse(raw) as StreakState;
+    return { count: parsed.count ?? 0, last: parsed.last ?? '' };
+  } catch {
+    return { count: 0, last: '' };
+  }
+}
+
+/**
+ * The streak a user SHOULD see right now: full credit if they already played
+ * today or yesterday (streak alive), otherwise it has lapsed back to 0.
+ */
+function effectiveStreak(s: StreakState, today: string, yesterday: string): number {
+  return s.last === today || s.last === yesterday ? s.count : 0;
+}
+
+/** Top-N of today's leaderboard, highest first. */
+async function readDailyTop(
+  date: string,
+  n: number
+): Promise<Array<{ member: string; score: number }>> {
+  return await redis.zRange(keys.daily(date), 0, n - 1, {
+    by: 'rank',
+    reverse: true,
+  });
 }
 
 // ===========================================================================
@@ -148,81 +249,136 @@ app.use(express.json());
 const router = express.Router();
 
 /**
+ * GET /api/init
+ * One round trip that boots the whole client: today's board plus everything
+ * needed to render the title screen (streak, best, played-today, leaderboard).
+ */
+router.get('/api/init', async (_req, res) => {
+  try {
+    const date = todayKey();
+    const userId = context.userId ?? 'anon';
+
+    // Fetch the username for the HUD/leaderboard; tolerate logged-out users.
+    let username: string | undefined;
+    try {
+      username = await reddit.getCurrentUsername();
+    } catch {
+      username = undefined;
+    }
+
+    const [playedRaw, bestRaw, streakState, dailyTop] = await Promise.all([
+      redis.get(keys.played(date, userId)),
+      redis.get(keys.best(userId)),
+      readStreak(userId),
+      readDailyTop(date, 10),
+    ]);
+
+    res.json({
+      board: generateDailyBoard(date),
+      username: username ?? 'sailor',
+      playedToday: Boolean(playedRaw),
+      todayScore: playedRaw ? Number(playedRaw) : null,
+      personalBest: Number(bestRaw ?? 0),
+      streak: effectiveStreak(streakState, date, yesterdayKey()),
+      leaderboard: dailyTop,
+      subreddit: context.subredditName ?? 'unknown',
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: String(err) });
+  }
+});
+
+/**
  * GET /api/getDailyBoard
- * Returns today's deterministic board. Safe to call as often as you like — it's
- * a pure function of the date, so there's nothing to persist here.
+ * Pure function of the date — same 8×8 layout for every player today.
  */
 router.get('/api/getDailyBoard', (_req, res) => {
-  const board = generateDailyBoard(todayKey());
-  res.json(board);
+  res.json(generateDailyBoard(todayKey()));
 });
 
 /**
  * POST /api/submitRun
  * Body: { score: number }
  *
- * Records a finished run. Guarantees ONE submission per user per day via a
- * Redis flag, then adds the score to the player's subreddit "faction" total
- * (a sorted set we can later render as a cross-subreddit leaderboard).
+ * Records a finished run. Enforces ONE scored run per user per day via a Redis
+ * flag; on success updates the daily streak, personal best, today's
+ * leaderboard, and the subreddit faction total — and returns all of them so
+ * the client can paint the game-over screen from a single response.
  */
 router.post('/api/submitRun', async (req, res) => {
-  const date = todayKey();
-  const userId = context.userId ?? 'anon';
-  const subreddit = context.subredditName ?? 'unknown';
+  try {
+    const date = todayKey();
+    const userId = context.userId ?? 'anon';
+    const subreddit = context.subredditName ?? 'unknown';
 
-  // Validate + clamp the incoming score so a tampered client can't inject junk.
-  const rawScore = Number((req.body ?? {}).score);
-  const score = Number.isFinite(rawScore)
-    ? Math.max(0, Math.min(9999, Math.floor(rawScore)))
-    : 0;
+    // Clamp the score so a tampered client can't inject nonsense.
+    const rawScore = Number((req.body ?? {}).score);
+    const score = Number.isFinite(rawScore)
+      ? Math.max(0, Math.min(MAX_PLAUSIBLE_SCORE, Math.floor(rawScore)))
+      : 0;
 
-  // --- One run per user per day -------------------------------------------
-  const dedupeKey = `sink:submitted:${date}:${userId}`;
-  const already = await redis.get(dedupeKey);
-  if (already) {
-    res.status(409).json({
-      ok: false,
-      reason: 'already_submitted',
-      message: 'You have already logged a voyage today. Come back tomorrow!',
+    // --- One scored run per user per day --------------------------------
+    const playedKey = keys.played(date, userId);
+    const already = await redis.get(playedKey);
+    if (already) {
+      res.status(409).json({
+        ok: false,
+        reason: 'already_submitted',
+        message: 'Today’s voyage is already logged — practice runs don’t count. New ship at midnight UTC!',
+      });
+      return;
+    }
+    // Flag expires ~48h out so old keys clean themselves up.
+    await redis.set(playedKey, String(score), {
+      expiration: new Date(Date.now() + 48 * 60 * 60 * 1000),
     });
-    return;
+
+    // --- Streak ----------------------------------------------------------
+    const prev = await readStreak(userId);
+    const streak = prev.last === yesterdayKey() ? prev.count + 1 : 1;
+    await redis.set(keys.streak(userId), JSON.stringify({ count: streak, last: date }));
+
+    // --- Personal best ---------------------------------------------------
+    const prevBest = Number((await redis.get(keys.best(userId))) ?? 0);
+    const personalBest = Math.max(prevBest, score);
+    if (personalBest !== prevBest) {
+      await redis.set(keys.best(userId), String(personalBest));
+    }
+
+    // --- Today's leaderboard (member = username so it's human-readable) --
+    let username: string | undefined;
+    try {
+      username = await reddit.getCurrentUsername();
+    } catch {
+      username = undefined;
+    }
+    const member = username ?? `sailor-${userId.slice(-6)}`;
+    const dailyKey = keys.daily(date);
+    await redis.zAdd(dailyKey, { member, score });
+    await redis.expire(dailyKey, 48 * 60 * 60); // self-clean after 2 days
+
+    // --- Faction (subreddit) total ---------------------------------------
+    const factionTotal = await redis.zIncrBy(keys.factions, subreddit, score);
+
+    res.json({
+      ok: true,
+      score,
+      personalBest,
+      isNewBest: score > prevBest,
+      streak,
+      faction: subreddit,
+      factionTotal,
+      leaderboard: await readDailyTop(date, 10),
+      you: member,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: String(err) });
   }
-
-  // Set the flag, and expire it ~36h out so tomorrow's key starts fresh.
-  await redis.set(dedupeKey, String(score), {
-    expiration: new Date(Date.now() + 36 * 60 * 60 * 1000),
-  });
-
-  // --- Faction (subreddit) scoreboard -------------------------------------
-  // zIncrBy bumps this subreddit's cumulative score in a global sorted set.
-  const factionKey = 'sink:factions';
-  const factionTotal = await redis.zIncrBy(factionKey, subreddit, score);
-
-  // Also keep a lightweight personal-best for this user (nice for the UI).
-  const bestKey = `sink:best:${userId}`;
-  const prevBest = Number((await redis.get(bestKey)) ?? 0);
-  const personalBest = Math.max(prevBest, score);
-  if (personalBest !== prevBest) {
-    await redis.set(bestKey, String(personalBest));
-  }
-
-  res.json({
-    ok: true,
-    score,
-    personalBest,
-    faction: subreddit,
-    factionTotal,
-  });
 });
 
 /**
  * POST /internal/menu/create-post
- * Backing endpoint for the subreddit moderator menu item declared in
- * devvit.json. Spawns a fresh Last Voyage post in the current subreddit.
- *
- * NOTE: the exact "create an app post" call has shifted across Devvit versions
- * (submitCustomPost / submitPost + splash). This uses the current form; adjust
- * the call if your installed CLI exposes a different signature.
+ * Moderator menu action (declared in devvit.json) — spawns a game post.
  */
 router.post('/internal/menu/create-post', async (_req, res) => {
   try {
@@ -234,31 +390,28 @@ router.post('/internal/menu/create-post', async (_req, res) => {
 
     const post = await reddit.submitCustomPost({
       subredditName,
-      title: '🌊 Last Voyage — escape today’s sinking ship!',
-      splash: {
-        appDisplayName: 'Last Voyage',
-        description: 'Grab the pearls. Dodge the sharks. Reach the lifeboat.',
+      title: '🌊 Last Voyage — the ship sinks today. Can you reach the lifeboat?',
+      textFallback: {
+        text: 'Last Voyage is an interactive daily escape game. Open this post on new Reddit or the app to play!',
       },
     });
 
-    res.json({ ok: true, postId: post.id });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      message: 'Failed to create post.',
-      error: String(err),
+    res.json({
+      showToast: 'Voyage launched! 🚢',
+      navigateTo: `https://reddit.com${post.permalink}`,
     });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: String(err) });
   }
 });
 
 app.use(router);
 
 // ---------------------------------------------------------------------------
-// Boot. Devvit provides the port via getServerPort(); createServer wires our
-// Express app into the runtime's request lifecycle.
+// Boot.
 // ---------------------------------------------------------------------------
 const port = getServerPort();
 const server = createServer(app);
 server.listen(port, () => {
-  console.log(`[last-voyage] server listening on :${port}`);
+  console.log(`[last-voyage] listening on :${port}`);
 });
