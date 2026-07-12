@@ -117,6 +117,8 @@ const MIME = {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const today = new Date().toISOString().slice(0, 10);
+  // Never cache during development — a rebuilt client must show on refresh.
+  res.setHeader('cache-control', 'no-store');
 
   if (url.pathname === '/api/init') {
     res.setHeader('content-type', 'application/json');

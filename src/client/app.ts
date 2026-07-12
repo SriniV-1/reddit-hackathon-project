@@ -1263,42 +1263,53 @@ function drawRailing(): void {
 function drawEntitiesAndPlayer(now: number): void {
   const grid = state.grid!;
   const playerRow = state.playerR;
+  // Buoyancy: pearls, crates, sharks and the lifeboat FLOAT — they visibly
+  // ride UP with the surface as the deck fills (in the entity's local
+  // tile-units the surface height IS the water height). Watching loot lift
+  // off the deck is the strongest "the level is rising" cue on screen.
+  const lift = waterHeightTiles(now) * TILE;
+
+  const drawAt = (r: number, c: number, fn: () => void, dy = 0): void => {
+    const { x, y } = rcToXY(r + 0.5, c + 0.5);
+    const k = tileWidthAt(r + 0.5) / TILE; // depth scale
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(k, k);
+    ctx.translate(0, dy);
+    fn();
+    ctx.restore();
+  };
 
   for (let r = 0; r < BOARD_SIZE; r++) {
+    // 1. Deck-bound things that get submerged: breaches and the survivor.
     for (let c = 0; c < BOARD_SIZE; c++) {
-      const kind = grid[r][c];
-      if (kind === 'empty') continue;
-      const { x, y } = rcToXY(r + 0.5, c + 0.5);
-      const k = tileWidthAt(r + 0.5) / TILE; // depth scale
-      ctx.save();
-      ctx.translate(x, y);
-      ctx.scale(k, k);
-      switch (kind) {
+      if (grid[r][c] === 'breach') drawAt(r, c, () => drawBreach(now));
+    }
+    if (Math.round(playerRow) === r) drawPlayer(now);
+
+    // 2. This row's slice of the rising water — covers the deck-bound.
+    drawWaterRowStrip(r, now);
+
+    // 3. Buoyant things, ON TOP of the surface.
+    for (let c = 0; c < BOARD_SIZE; c++) {
+      switch (grid[r][c]) {
         case 'pearl':
-          drawPearl(now);
+          drawAt(r, c, () => drawPearl(now), -lift);
           break;
         case 'crate':
-          drawCrate();
+          drawAt(r, c, () => drawCrate(), -lift);
           break;
         case 'shark':
-          drawShark(now);
-          break;
-        case 'breach':
-          drawBreach(now);
+          // A shark swims: body just under the surface, fin above it.
+          drawAt(r, c, () => drawShark(now), -lift * 0.85);
           break;
         case 'lifeboat':
-          drawLifeboat(now);
+          drawAt(r, c, () => drawLifeboat(now), -lift);
           break;
         default:
           break;
       }
-      ctx.restore();
     }
-    if (Math.round(playerRow) === r) drawPlayer(now);
-    // This row's slice of the flood, AFTER its occupants: the water visibly
-    // rises from the deck floor up their bodies and over their heads, while
-    // nearer (not-yet-drawn) rows will correctly overlap it from the front.
-    drawWaterRowStrip(r, now);
   }
 }
 
@@ -1557,6 +1568,31 @@ function drawPlayer(now: number): void {
   ctx.fill();
 
   ctx.restore();
+
+  // --- Submersion overlay: THE "water is rising" shot -----------------------
+  // Water drawn ON the survivor, from the feet up to the current waterline,
+  // with a foam ring lapping around the body. As the global level climbs you
+  // watch this line travel up their legs, chest, and finally over their head.
+  // (Drawn in the un-hopped frame so the waterline stays put while they jump.)
+  const h = waterHeightTiles(now); // tile-units
+  if (h > 0.03) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(k, k);
+    const yDeckLocal = TILE * 0.3; // the deck plane at the feet
+    const yLine = yDeckLocal - h * TILE; // local waterline height
+    // The water column in front of the body.
+    ctx.fillStyle = 'rgba(23, 108, 153, 0.45)';
+    ctx.fillRect(-TILE * 0.46, yLine, TILE * 0.92, yDeckLocal - yLine + TILE * 0.12);
+    // Foam lapping around them at the waterline.
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
+    ctx.lineWidth = Math.max(1.5, TILE * 0.035);
+    ctx.beginPath();
+    const lap = Math.sin(now / 240) * TILE * 0.015;
+    ctx.ellipse(0, yLine + lap, TILE * 0.34, TILE * 0.09, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 /**
@@ -1603,8 +1639,10 @@ function drawWaterRowStrip(r: number, now: number): void {
     waterSurfaceY(rr, now) + Math.sin(now / 320 + rr * 2.1) * TILE * 0.02;
 
   // The slice as a stack of thin quads tracing the receding surface plane.
+  // Alpha ramps hard with depth: barely-there film at first, dense blue when
+  // it's over your head — shallow water must NOT read as a solid tint.
   const S = 4;
-  const alpha = 0.4 + 0.35 * Math.min(1, h / WATER_HEAD);
+  const alpha = 0.1 + 0.42 * Math.min(1, h / WATER_HEAD);
   ctx.fillStyle = `rgba(23, 108, 153, ${alpha.toFixed(3)})`;
   for (let i = 0; i < S; i++) {
     const rr0 = r + i / S;
@@ -1646,12 +1684,17 @@ function drawFloodExtras(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
 
-  // Front face: translucent wall from the near deck edge up to the surface.
+  // Front face: the water's cross-section at the near edge — a wall that
+  // visibly GROWS TALLER as the level climbs (brighter at the surface,
+  // darker toward the deck).
   const xl = waterXL(BOARD_SIZE);
   const xr = waterXR(BOARD_SIZE);
   const ySurf = waterSurfaceY(BOARD_SIZE, now);
   const yDeckNear = BOARD_Y + BOARD_H + RAIL;
-  ctx.fillStyle = 'rgba(12, 70, 104, 0.72)';
+  const wall = ctx.createLinearGradient(0, ySurf, 0, yDeckNear);
+  wall.addColorStop(0, 'rgba(56, 140, 185, 0.85)');
+  wall.addColorStop(1, 'rgba(8, 46, 72, 0.9)');
+  ctx.fillStyle = wall;
   ctx.fillRect(xl, ySurf, xr - xl, Math.max(0, yDeckNear - ySurf));
 
   // Foam line along the front surface edge — the waterline that rises.
@@ -1664,6 +1707,24 @@ function drawFloodExtras(now: number): void {
     if (firstF) {
       ctx.moveTo(x, y);
       firstF = false;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+
+  // Faint foam along the BACK edge of the surface sheet (row 0) — the far
+  // boundary of the rising plane, climbing the stern rail.
+  const ySurfFar = waterSurfaceY(0, now);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  let firstB = true;
+  for (let x = waterXL(0); x <= waterXR(0); x += 10) {
+    const y = ySurfFar + Math.sin(x / 20 + now / 300) * TILE * 0.02;
+    if (firstB) {
+      ctx.moveTo(x, y);
+      firstB = false;
     } else {
       ctx.lineTo(x, y);
     }
