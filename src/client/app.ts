@@ -393,6 +393,16 @@ interface MoveAnim {
   start: number;
 }
 
+/** A bubble rising through the water volume from deck to surface. */
+interface Bubble {
+  rr: number; // board row (continuous)
+  cc: number; // board col (continuous)
+  born: number;
+  dur: number;
+  size: number;
+  phase: number; // wobble offset
+}
+
 const state = {
   phase: 'loading' as Phase,
   error: '',
@@ -421,6 +431,7 @@ const state = {
 
   ending: null as Ending,
   particles: [] as Particle[],
+  bubbles: [] as Bubble[],
   shake: { mag: 0, until: 0 },
 
   submitState: 'idle' as 'idle' | 'sending' | 'done' | 'error',
@@ -493,6 +504,7 @@ function startRun(practice: boolean): void {
   state.nextStruggleAt = 0;
   state.ending = null;
   state.particles = [];
+  state.bubbles = [];
   state.submitState = 'idle';
   state.submit = null;
   state.submitMsg = '';
@@ -1089,10 +1101,13 @@ function drawGame(now: number): void {
 
   drawHullSide(now);
   drawDeck(now);
+  drawDeckCaustics(now); // dancing light on the drowned planks (under entities)
   drawRailing();
   drawEntitiesAndPlayer(now); // water strips are interleaved per row inside
-  drawFloodExtras(now);
-  drawDepthDarkness(now); // the deeper it gets, the darker the world
+  drawFloodExtras(now); // front wall, meniscus, bubbles, glints, motes
+  drawDepthFog(now); // distance-graded darkness — the world sinks toward black
+  drawGodRays(now); // moonlight shafts cutting through the risen water
+  drawCinematicVignette(now);
   drawParticles(now);
 
   ctx.restore();
@@ -1599,6 +1614,23 @@ function drawPlayer(now: number): void {
     const lap = Math.sin(now / 240) * TILE * 0.015;
     ctx.ellipse(0, yLine + lap, TILE * 0.34, TILE * 0.09, 0, 0, Math.PI * 2);
     ctx.stroke();
+
+    // Exhaled air once they're going under — a thin trail of bubbles racing
+    // for the surface.
+    if (h > 0.55) {
+      ctx.fillStyle = 'rgba(220, 245, 255, 0.55)';
+      for (let i = 0; i < 3; i++) {
+        const p = (now / 900 + i * 0.33) % 1;
+        const from = -TILE * 0.2;
+        const to = yLine - TILE * 0.1;
+        if (to >= from) continue;
+        const bx = Math.sin(now / 200 + i * 2.1) * TILE * 0.07;
+        const by = from + (to - from) * p;
+        ctx.beginPath();
+        ctx.arc(bx, by, TILE * (0.014 + 0.02 * p), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
     ctx.restore();
   }
 }
@@ -1657,153 +1689,357 @@ function glowHalo(now: number, rgb: string, radius: number, strength = 0.5): voi
   ctx.fillRect(-radius, -radius, radius * 2, radius * 2);
 }
 
+// ===========================================================================
+//  WATER FX SUITE — cinematic three-act sink
+//  Act I  (0–35%):  a glassy teal film, glints skating across the surface
+//  Act II (35–65%): heavy ocean volume, caustics dancing on the drowned deck
+//  Act III (65%+):  black abyss cut by god-rays, lit by bioluminescence
+// ===========================================================================
+
+/** Three-octave surface wave: slow swell + medium chop + fast ripple. */
+function waveAt(rr: number, now: number): number {
+  return (
+    (Math.sin(now / 1400 + rr * 0.9) * 0.62 +
+      Math.sin(now / 620 + rr * 1.9) * 0.5 +
+      Math.sin(now / 240 + rr * 3.7) * 0.28) *
+    TILE *
+    0.028
+  );
+}
+
+/** The animated surface height at rr — deck plane lifted by level + wave. */
+function liveSurfaceY(rr: number, now: number): number {
+  return waterSurfaceY(rr, now) + waveAt(rr, now);
+}
+
+/** Linear mix of two RGB triples, as a CSS color with the given alpha. */
+function mixRgba(
+  a: readonly [number, number, number],
+  b: readonly [number, number, number],
+  t: number,
+  alpha: number
+): string {
+  const r = Math.round(a[0] + (b[0] - a[0]) * t);
+  const g = Math.round(a[1] + (b[1] - a[1]) * t);
+  const bl = Math.round(a[2] + (b[2] - a[2]) * t);
+  return `rgba(${r}, ${g}, ${bl}, ${alpha.toFixed(3)})`;
+}
+
+const WATER_NEAR: readonly [number, number, number] = [24, 118, 160]; // lagoon
+const WATER_FAR: readonly [number, number, number] = [4, 34, 58]; // abyss
+
 /**
  * One row's slice of the global water surface. Called from
  * drawEntitiesAndPlayer IMMEDIATELY after that row's occupants so occlusion
  * is correct: the water visibly climbs each character's body from the floor,
- * and nearer rows' strips overlap from the front.
+ * and nearer rows' strips overlap from the front. Color is distance-fogged
+ * (near = lagoon teal, far = abyssal navy) and density grows with the level.
  */
 function drawWaterRowStrip(r: number, now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
 
-  const surfY = (rr: number): number =>
-    waterSurfaceY(rr, now) + Math.sin(now / 320 + rr * 2.1) * TILE * 0.02;
-
-  // The slice as a stack of thin quads tracing the receding surface plane.
-  // Alpha ramps hard with depth: barely-there film at first, dense blue when
-  // it's over your head — shallow water must NOT read as a solid tint.
-  const S = 4;
   const alpha = 0.16 + 0.55 * Math.min(1, h / WATER_HEAD);
-  ctx.fillStyle = `rgba(13, 74, 110, ${alpha.toFixed(3)})`;
+  const S = 4;
   for (let i = 0; i < S; i++) {
     const rr0 = r + i / S;
     const rr1 = r + (i + 1) / S;
+    // Distance fog: farther slices read darker and colder.
+    ctx.fillStyle = mixRgba(WATER_NEAR, WATER_FAR, 1 - tAt((rr0 + rr1) / 2), alpha);
     ctx.beginPath();
-    ctx.moveTo(waterXL(rr0), surfY(rr0));
-    ctx.lineTo(waterXR(rr0), surfY(rr0));
-    ctx.lineTo(waterXR(rr1), surfY(rr1));
-    ctx.lineTo(waterXL(rr1), surfY(rr1));
+    ctx.moveTo(waterXL(rr0), liveSurfaceY(rr0, now));
+    ctx.lineTo(waterXR(rr0), liveSurfaceY(rr0, now));
+    ctx.lineTo(waterXR(rr1), liveSurfaceY(rr1, now));
+    ctx.lineTo(waterXL(rr1), liveSurfaceY(rr1, now));
     ctx.closePath();
     ctx.fill();
   }
-
-  // Caustic shimmer across the middle of this strip.
-  const rrMid = r + 0.5;
-  const yMid = surfY(rrMid);
-  ctx.strokeStyle = 'rgba(197, 233, 250, 0.16)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  let firstPt = true;
-  for (let x = waterXL(rrMid); x <= waterXR(rrMid); x += 12) {
-    const y = yMid + Math.sin(x / 28 + now / 380 + r) * 3;
-    if (firstPt) {
-      ctx.moveTo(x, y);
-      firstPt = false;
-    } else {
-      ctx.lineTo(x, y);
-    }
-  }
-  ctx.stroke();
 }
 
 /**
- * After all rows: the water's FRONT FACE at the near edge (the cross-section
- * you watch climb — the clearest "filling vertically" cue), surface bubbles,
- * and a danger vignette once the survivor is struggling.
+ * Caustic light dancing on the submerged deck — two interfering wave lattices
+ * drawn UNDER the entities, clipped to the board trapezoid. The classic
+ * "swimming-pool floor" shimmer that instantly reads as water over wood.
+ */
+function drawDeckCaustics(now: number): void {
+  const h = waterHeightTiles(now);
+  if (h <= 0.02) return;
+
+  const farL = rcToXY(0, 0);
+  const farR = rcToXY(0, BOARD_SIZE);
+  const nearL = rcToXY(BOARD_SIZE, 0);
+  const nearR = rcToXY(BOARD_SIZE, BOARD_SIZE);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(farL.x, farL.y);
+  ctx.lineTo(farR.x, farR.y);
+  ctx.lineTo(nearR.x, nearR.y);
+  ctx.lineTo(nearL.x, nearL.y);
+  ctx.closePath();
+  ctx.clip();
+  ctx.globalCompositeOperation = 'overlay';
+
+  const strength = 0.12 + 0.16 * Math.min(1, h / WATER_HEAD);
+  const bands = 9;
+  for (let pass = 0; pass < 2; pass++) {
+    ctx.strokeStyle = `rgba(168, 228, 255, ${(strength * (pass === 0 ? 1 : 0.7)).toFixed(3)})`;
+    ctx.lineWidth = pass === 0 ? 1.6 : 1.1;
+    for (let j = 0; j < bands; j++) {
+      const y0 = BOARD_Y + (BOARD_H * (j + 0.5)) / bands;
+      ctx.beginPath();
+      let first = true;
+      for (let x = nearL.x; x <= nearR.x; x += 14) {
+        const y =
+          y0 +
+          (pass === 0
+            ? Math.sin(x / 34 + now / 450 + j * 1.8) * 5
+            : Math.sin(x / 21 - now / 380 + j * 2.6) * 4);
+        if (first) {
+          ctx.moveTo(x, y);
+          first = false;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+/**
+ * After all rows: the water's FRONT FACE (the cross-section that visibly
+ * grows), its glowing meniscus, rising bubble streams, specular glints, and
+ * drifting motes. The set-dressing that makes the volume feel alive.
  */
 function drawFloodExtras(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
 
-  // Front face: the water's cross-section at the near edge — a wall that
-  // visibly GROWS TALLER as the level climbs (brighter at the surface,
-  // darker toward the deck).
+  // --- Front face: the growing cross-section wall -------------------------
   const xl = waterXL(BOARD_SIZE);
   const xr = waterXR(BOARD_SIZE);
-  const ySurf = waterSurfaceY(BOARD_SIZE, now);
+  const ySurf = liveSurfaceY(BOARD_SIZE, now);
   const yDeckNear = BOARD_Y + BOARD_H + RAIL;
   const wall = ctx.createLinearGradient(0, ySurf, 0, yDeckNear);
-  wall.addColorStop(0, 'rgba(40, 120, 165, 0.88)');
-  wall.addColorStop(1, 'rgba(4, 30, 50, 0.94)');
+  wall.addColorStop(0, 'rgba(64, 158, 205, 0.9)');
+  wall.addColorStop(0.25, 'rgba(24, 100, 142, 0.88)');
+  wall.addColorStop(1, 'rgba(3, 24, 42, 0.95)');
   ctx.fillStyle = wall;
   ctx.fillRect(xl, ySurf, xr - xl, Math.max(0, yDeckNear - ySurf));
 
-  // Foam line along the front surface edge — the waterline that rises.
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  let firstF = true;
-  for (let x = xl; x <= xr; x += 10) {
-    const y = ySurf + Math.sin(x / 24 + now / 280) * TILE * 0.04;
-    if (firstF) {
-      ctx.moveTo(x, y);
-      firstF = false;
-    } else {
-      ctx.lineTo(x, y);
-    }
-  }
-  ctx.stroke();
-
-  // Faint foam along the BACK edge of the surface sheet (row 0) — the far
-  // boundary of the rising plane, climbing the stern rail.
-  const ySurfFar = waterSurfaceY(0, now);
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  let firstB = true;
-  for (let x = waterXL(0); x <= waterXR(0); x += 10) {
-    const y = ySurfFar + Math.sin(x / 20 + now / 300) * TILE * 0.02;
-    if (firstB) {
-      ctx.moveTo(x, y);
-      firstB = false;
-    } else {
-      ctx.lineTo(x, y);
-    }
-  }
-  ctx.stroke();
-
-  // Bobbing bubbles riding the surface.
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
-  for (let i = 0; i < 6; i++) {
-    const rr = (i * 1.3 + now / 2600) % BOARD_SIZE;
-    const cc = (i * 2.7 + Math.sin(now / 900 + i) + BOARD_SIZE) % BOARD_SIZE;
-    const sx = VIEW_W / 2 + (cc - BOARD_SIZE / 2) * (widthAt(tAt(rr)) / BOARD_SIZE);
-    const sy = waterSurfaceY(rr, now) + Math.sin(now / 350 + i * 2) * 2;
-    const br = tileWidthAt(rr) * 0.045;
+  // --- Meniscus: the glowing waterline you watch climb ---------------------
+  const meniscus = (y0: number, x0: number, x1: number, strength: number): void => {
+    ctx.save();
+    ctx.shadowColor = `rgba(159, 232, 255, ${(0.9 * strength).toFixed(3)})`;
+    ctx.shadowBlur = 10;
+    ctx.strokeStyle = `rgba(235, 251, 255, ${(0.95 * strength).toFixed(3)})`;
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
-    ctx.arc(sx, sy, br, 0, Math.PI * 2);
-    ctx.fill();
-  }
+    let first = true;
+    for (let x = x0; x <= x1; x += 8) {
+      const y =
+        y0 + Math.sin(x / 24 + now / 300) * TILE * 0.03 + Math.sin(x / 9 - now / 210) * TILE * 0.012;
+      if (first) {
+        ctx.moveTo(x, y);
+        first = false;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+    // Refraction underline: a soft cyan echo just beneath the crest.
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = `rgba(127, 212, 255, ${(0.35 * strength).toFixed(3)})`;
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    first = true;
+    for (let x = x0; x <= x1; x += 8) {
+      const y =
+        y0 +
+        TILE * 0.045 +
+        Math.sin(x / 24 + now / 300) * TILE * 0.03 +
+        Math.sin(x / 9 - now / 210) * TILE * 0.012;
+      if (first) {
+        ctx.moveTo(x, y);
+        first = false;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+    ctx.restore();
+  };
+  meniscus(ySurf, xl, xr, 1);
+  meniscus(liveSurfaceY(0, now), waterXL(0), waterXR(0), 0.45);
 
-  // Danger vignette while chest-deep: the edges of the deck pulse red.
-  drawDangerVignette(now, h);
+  updateAndDrawBubbles(now, h);
+  drawSurfaceGlints(now, h);
+  drawMotes(now);
+}
+
+/** Deterministic 0..1 hash for stable pseudo-random FX placement. */
+function hash01(n: number): number {
+  const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return s - Math.floor(s);
 }
 
 /**
- * The scene sinks into the abyss: a darkness overlay whose strength climbs
- * steeply with the water level. Under it, the glowHalo()s on every relevant
- * entity are what keep the board readable — dark world, glowing things.
+ * Bubble streams: seeded at random tiles, they rise from the drowned deck to
+ * the surface with a sinusoidal wobble, growing and brightening, then vanish
+ * at the meniscus. Constant quiet motion that makes the volume read as LIQUID.
  */
-function drawDepthDarkness(now: number): void {
+function updateAndDrawBubbles(now: number, h: number): void {
+  if (state.phase === 'playing' && h > 0.08 && state.bubbles.length < 16 && Math.random() < 0.2) {
+    state.bubbles.push({
+      rr: Math.random() * BOARD_SIZE,
+      cc: Math.random() * BOARD_SIZE,
+      born: now,
+      dur: 1600 + Math.random() * 1400,
+      size: TILE * (0.02 + Math.random() * 0.03),
+      phase: Math.random() * Math.PI * 2,
+    });
+  }
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  state.bubbles = state.bubbles.filter((b) => now - b.born < b.dur);
+  for (const b of state.bubbles) {
+    const p = (now - b.born) / b.dur;
+    const deckY = BOARD_Y + BOARD_H * tAt(b.rr);
+    const surfY = liveSurfaceY(b.rr, now);
+    const y = deckY + (surfY - deckY) * p;
+    const x =
+      VIEW_W / 2 +
+      (b.cc - BOARD_SIZE / 2) * (widthAt(tAt(b.rr)) / BOARD_SIZE) +
+      Math.sin(now / 260 + b.phase) * TILE * 0.04;
+    ctx.strokeStyle = `rgba(220, 245, 255, ${(0.15 + 0.3 * p).toFixed(3)})`;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(x, y, b.size * (0.7 + 0.5 * p), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/** Specular glints — sparks of moonlight skating on the surface plane. */
+function drawSurfaceGlints(now: number, h: number): void {
+  const vis = Math.min(1, h / 0.3);
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 14; i++) {
+    const rr = hash01(i) * BOARD_SIZE;
+    const cc = hash01(i + 57) * BOARD_SIZE;
+    const flicker = Math.pow(Math.max(0, Math.sin(now / (160 + i * 7) + i * 2.3)), 4) * vis;
+    if (flicker < 0.03) continue;
+    const tw = tileWidthAt(rr);
+    const x = VIEW_W / 2 + (cc - BOARD_SIZE / 2) * (widthAt(tAt(rr)) / BOARD_SIZE);
+    const y = liveSurfaceY(rr, now);
+    ctx.fillStyle = `rgba(201, 241, 255, ${(0.5 * flicker).toFixed(3)})`;
+    ctx.beginPath();
+    ctx.ellipse(x, y, tw * 0.16 * (0.6 + 0.4 * flicker), tw * 0.02 + 0.6, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/** Drifting motes in the deep-water light — plankton in the beams. */
+function drawMotes(now: number): void {
+  const g = depthGlow(now);
+  if (g <= 0.05) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 16; i++) {
+    const rr = (hash01(i + 200) * BOARD_SIZE + now / 9000) % BOARD_SIZE;
+    const cc = (hash01(i + 300) * BOARD_SIZE + Math.sin(now / 4000 + i) * 0.3 + BOARD_SIZE) % BOARD_SIZE;
+    const deckY = BOARD_Y + BOARD_H * tAt(rr);
+    const surfY = liveSurfaceY(rr, now);
+    const y = surfY + (deckY - surfY) * hash01(i + 400);
+    const x = VIEW_W / 2 + (cc - BOARD_SIZE / 2) * (widthAt(tAt(rr)) / BOARD_SIZE);
+    const a = 0.12 * g * (0.5 + 0.5 * Math.sin(now / 700 + i * 1.7));
+    ctx.fillStyle = `rgba(190, 235, 255, ${a.toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(x, y, 1 + hash01(i + 500) * 1.4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/**
+ * Depth fog — distance-graded, not flat: the far (stern) end of the drowned
+ * deck vanishes first, exactly like looking down a flooding corridor.
+ */
+function drawDepthFog(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
-  const dark = 0.55 * Math.pow(h / WATER_HEAD, 1.4);
-  ctx.fillStyle = `rgba(1, 10, 22, ${dark.toFixed(3)})`;
+  const f = Math.pow(h / WATER_HEAD, 1.3);
+  const g = ctx.createLinearGradient(0, HUD_H, 0, VIEW_H);
+  g.addColorStop(0, `rgba(2, 14, 28, ${(0.65 * f).toFixed(3)})`);
+  g.addColorStop(0.55, `rgba(2, 14, 28, ${(0.35 * f).toFixed(3)})`);
+  g.addColorStop(1, `rgba(3, 18, 34, ${(0.45 * f).toFixed(3)})`);
+  ctx.fillStyle = g;
   ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
 }
 
-/** Red pulse at the deck edges once the survivor is struggling. */
-function drawDangerVignette(now: number, h: number): void {
-  if (state.phase !== 'playing' || h < WATER_CHEST) return;
-  const pulse = 0.08 + 0.08 * Math.abs(Math.sin(now / 220));
-  const g = ctx.createLinearGradient(0, HUD_H, 0, VIEW_H);
-  g.addColorStop(0, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
-  g.addColorStop(0.3, 'rgba(255, 97, 97, 0)');
-  g.addColorStop(0.7, 'rgba(255, 97, 97, 0)');
-  g.addColorStop(1, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
-  ctx.fillStyle = g;
+/**
+ * God-rays: shafts of moonlight refracting down through the risen water,
+ * swaying slowly. Screen-composited so they cut through the depth fog.
+ */
+function drawGodRays(now: number): void {
+  const h = waterHeightTiles(now);
+  const f = Math.max(0, Math.min(1, (h - 0.25) / (WATER_HEAD - 0.25)));
+  if (f <= 0.02) return;
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  for (let i = 0; i < 5; i++) {
+    const baseX = VIEW_W * (0.1 + 0.2 * i) + Math.sin(now / 2800 + i * 1.7) * VIEW_W * 0.03;
+    const breath = 0.7 + 0.3 * Math.sin(now / 1900 + i * 2.2);
+    const wTop = VIEW_W * (0.012 + 0.006 * hash01(i + 40));
+    const wBot = wTop * 2.6;
+    const slant = VIEW_W * 0.09;
+    const topY = HUD_H;
+    const botY = VIEW_H * 0.96;
+    const grad = ctx.createLinearGradient(0, topY, 0, botY);
+    grad.addColorStop(0, `rgba(140, 214, 255, ${(0.11 * f * breath).toFixed(3)})`);
+    grad.addColorStop(1, 'rgba(140, 214, 255, 0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(baseX - wTop, topY);
+    ctx.lineTo(baseX + wTop, topY);
+    ctx.lineTo(baseX + slant + wBot, botY);
+    ctx.lineTo(baseX + slant - wBot, botY);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/**
+ * Cinematic vignette — always on for depth-of-frame, deepening as the water
+ * rises, with the red danger pulse folded in once the survivor is struggling.
+ */
+function drawCinematicVignette(now: number): void {
+  const h = waterHeightTiles(now);
+  const base = 0.2 + 0.32 * Math.pow(Math.min(1, h / WATER_HEAD), 1.2);
+  const cy = BOARD_Y + BOARD_H / 2;
+  const vg = ctx.createRadialGradient(VIEW_W / 2, cy, VIEW_W * 0.42, VIEW_W / 2, cy, VIEW_W * 0.85);
+  vg.addColorStop(0, 'rgba(1, 8, 16, 0)');
+  vg.addColorStop(1, `rgba(1, 8, 16, ${base.toFixed(3)})`);
+  ctx.fillStyle = vg;
   ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
+
+  if (state.phase === 'playing' && h >= WATER_CHEST) {
+    const pulse = 0.08 + 0.08 * Math.abs(Math.sin(now / 220));
+    const g = ctx.createLinearGradient(0, HUD_H, 0, VIEW_H);
+    g.addColorStop(0, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
+    g.addColorStop(0.3, 'rgba(255, 97, 97, 0)');
+    g.addColorStop(0.7, 'rgba(255, 97, 97, 0)');
+    g.addColorStop(1, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
+  }
 }
 
 function drawParticles(now: number): void {
@@ -1856,7 +2092,7 @@ function drawHud(now: number): void {
   ctx.font = `600 ${Math.floor(HUD_H * 0.2)}px sans-serif`;
   ctx.fillText(`${left} ${left === 1 ? 'move' : 'moves'} left`, VIEW_W - pad, HUD_H * 0.72);
 
-  // Flood ticker, centered: the water level and time until it tops your head.
+  // Flood ticker + water gauge, centered.
   if (state.phase === 'playing') {
     ctx.textAlign = 'center';
     const h = waterHeightTiles(now);
@@ -1864,15 +2100,39 @@ function drawHud(now: number): void {
     const struggling = h >= WATER_CHEST;
     const urgent = struggling && Math.floor(now / 220) % 2 === 0;
     ctx.fillStyle = urgent ? COLORS.danger : COLORS.breachFoam;
-    ctx.font = `700 ${Math.floor(HUD_H * 0.2)}px sans-serif`;
-    const pct = Math.round((h / WATER_HEAD) * 100);
+    ctx.font = `700 ${Math.floor(HUD_H * 0.19)}px sans-serif`;
     ctx.fillText(
-      struggling
-        ? `🌊 ${pct}% — DROWNING in ${tLeft.toFixed(1)}s`
-        : `🌊 water ${pct}% — overhead in ${Math.ceil(tLeft)}s`,
+      struggling ? `🌊 DROWNING in ${tLeft.toFixed(1)}s` : `🌊 overhead in ${Math.ceil(tLeft)}s`,
       VIEW_W / 2,
-      HUD_H * 0.5
+      HUD_H * 0.36
     );
+
+    // Water gauge: a slim graded bar filling toward the drown mark, with a
+    // notch at chest depth (where the struggling starts).
+    const gw = VIEW_W * 0.26;
+    const gh = Math.max(4, HUD_H * 0.09);
+    const gx = VIEW_W / 2 - gw / 2;
+    const gy = HUD_H * 0.6;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+    roundRect(gx, gy, gw, gh, gh / 2);
+    ctx.fill();
+    const frac = Math.min(1, h / WATER_HEAD);
+    if (frac > 0.03) {
+      const fg = ctx.createLinearGradient(gx, 0, gx + gw, 0);
+      fg.addColorStop(0, '#67c7ef');
+      fg.addColorStop(0.6, '#2f8fc4');
+      fg.addColorStop(1, '#ff6161');
+      ctx.fillStyle = fg;
+      roundRect(gx, gy, Math.max(gh, gw * frac), gh, gh / 2);
+      ctx.fill();
+    }
+    // Chest-depth notch.
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+    ctx.fillRect(gx + gw * (WATER_CHEST / WATER_HEAD) - 1, gy - 1.5, 2, gh + 3);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+    ctx.lineWidth = 1;
+    roundRect(gx, gy, gw, gh, gh / 2);
+    ctx.stroke();
   }
 }
 
