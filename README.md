@@ -10,10 +10,13 @@ flooding deck, grab pearls, dodge sharks, and reach the lifeboat before your mov
 out and the sea takes the board.
 
 Everything on screen — the moonlit title ship, waves, pearls, sharks, whirlpools, the
-lifeboat, every particle — is drawn live with the **HTML5 Canvas API** in a 2.5D
-"GBA-overworld" style (beveled tiles, drop shadows, painter's-order entities, a walking
-chibi survivor), and every sound is **synthesized with WebAudio oscillators**. There are
-*zero* image or audio assets in this app.
+lifeboat, every particle — is drawn live with the **HTML5 Canvas API** in a "2.75D"
+perspective: the deck is a true trapezoid with a vanishing point (far rows smaller,
+near rows bigger), entities scale with depth and stand on their tiles in painter's
+order, and the flood is rendered as a **rising water volume** — one surface plane that
+climbs vertically from the deck floor, up every character's body, and over their heads,
+with a visible cross-section front face at the near edge. Every sound is **synthesized
+with WebAudio oscillators**. There are *zero* image or audio assets in this app.
 
 ---
 
@@ -30,10 +33,12 @@ chibi survivor), and every sound is **synthesized with WebAudio oscillators**. T
 3. **Move** by tapping any adjacent tile (or arrow keys / WASD on desktop). You start at
    the stern `[0,0]` with **3 HP** and **18 moves**; the lifeboat waits at `[7,7]` —
    exactly 14 moves away if you sprint, so every detour for treasure is a gamble.
-4. **The ship sinks in real time.** After a 20-second grace period the stern row goes
-   under, and the flood claims another row every 8 seconds, chasing you toward the
-   lifeboat. **Wading through flooded tiles costs 1 HP per step** — and if the water
-   catches the row you're standing on, you take a hit. Think fast, move faster.
+4. **The ship sinks in real time — fast.** The water starts rising the instant you pick
+   your relic and fills the whole deck **vertically, floor to over-your-head, in 20
+   seconds** — one shared water level everywhere, like a room filling up. You watch it
+   climb every character's body at once. **Chest-deep (from ~10s) you start struggling:
+   1 HP every 4 seconds.** When it tops your head, you drown. The only way out is the
+   lifeboat. Think fast, move faster.
 5. **Score:** 🦪 pearl **+10** · 📦 supply crate **+50** · 🚣 lifeboat **+100** (plus
    +5 per unused move) · 🦈 shark / 🌀 hull breach **−1 HP**.
 

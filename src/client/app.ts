@@ -2,16 +2,18 @@
  * ============================================================================
  *  LAST VOYAGE — Devvit Web client (100% HTML5 Canvas, zero image assets)
  * ============================================================================
- *  The ship is going down. You start at the stern [0,0] with 3 HP and 18
- *  moves. Grab pearls, crack open supply crates, dodge sharks and hull
- *  breaches, and reach the lifeboat at [7,7] — and don't dawdle: the sea
- *  floods the deck row by row in REAL TIME, from the stern toward the bow.
+ *  The ship is going down FAST. You start at the stern [0,0] with 3 HP and 18
+ *  moves. The flood starts the moment you step on deck and swallows the whole
+ *  board in 20 seconds — one row every 2.5s, chasing you toward the lifeboat
+ *  at [7,7]. Grab pearls and crates on the way if you dare; wading through
+ *  flooded tiles costs HP.
  *
- *  Rendering: a 2.5D "GBA overworld" look built purely from canvas
- *  primitives — beveled tiles, drop shadows, entities that stand on their
- *  tiles and overlap the row behind them (painter's order), a walking player
- *  character, and volumetric flood water with foam and caustic shimmer.
- *  Sound is synthesized live with WebAudio. No image or audio files exist.
+ *  Rendering: "2.75D" — the deck is drawn as a true perspective trapezoid
+ *  with a vanishing point (far rows narrower and shorter, near rows wider and
+ *  taller), entities scale with depth, and everything stands on its tile with
+ *  a drop shadow, painted in row order so near things overlap far things.
+ *  All of it is canvas primitives; sound is synthesized WebAudio. There are
+ *  no image or audio files anywhere in this app.
  *
  *  Movement lerps over ~150ms with smoothstep (never snaps). Damage shakes
  *  the screen. Pearls burst into expanding rings.
@@ -80,9 +82,8 @@ interface Hitbox {
 }
 
 // ---------------------------------------------------------------------------
-// Tunables. Difficulty numbers are simulation-backed (see README): 18 moves
-// gives ~4 moves of slack over the 14-move sprint — enough to detour for 2-3
-// treasures with sharp routing, never enough to loot the whole deck.
+// Tunables. Move budget is simulation-backed (README): 18 gives ~4 moves of
+// slack over the 14-move sprint. The flood is the real-time pressure on top.
 // ---------------------------------------------------------------------------
 const BOARD_SIZE = 8;
 const BASE_MAX_STEPS = 18;
@@ -90,10 +91,10 @@ const SEA_LEGS_BONUS = 4;
 const START_HP = 3;
 const MOVE_MS = 150; // lerp duration between tiles
 
-// Real-time flood: after FLOOD_GRACE_S seconds the stern row (row 0) goes
-// under, then one more row every FLOOD_ROW_S seconds. Wading costs HP.
-const FLOOD_GRACE_S = 20;
-const FLOOD_ROW_S = 8;
+// Real-time flood: the water starts rising the FIRST instant of gameplay and
+// fills the deck VERTICALLY — floor to over-your-head in FLOOD_TOTAL_S,
+// everywhere at once (one global water level, like a room filling up).
+const FLOOD_TOTAL_S = 20;
 
 const POINTS = {
   pearl: 10,
@@ -142,8 +143,16 @@ const COLORS = {
 } as const;
 
 // ---------------------------------------------------------------------------
-// Canvas + layout. The board is inset from the edges so a wooden railing can
-// frame the deck (part of the 2.5D look). Portrait: [HUD | railed board | sea].
+// Canvas + perspective layout ("2.75D").
+//
+// The deck is a trapezoid seen from a low three-quarter camera:
+//   • far (top) rows are NARROWER and SHORTER — they converge toward a
+//     vanishing point behind the horizon;
+//   • near (bottom) rows are WIDER and TALLER;
+//   • an entity's draw scale follows its row's tile width.
+//
+// All mapping goes through rcToXY(rr, cc) (continuous board coords → screen)
+// and xyToRC (screen → board cell), so gameplay logic stays grid-pure.
 // ---------------------------------------------------------------------------
 const canvas = document.getElementById('game') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
@@ -151,11 +160,35 @@ const ctx = canvas.getContext('2d')!;
 let VIEW_W = 0;
 let VIEW_H = 0;
 let HUD_H = 0;
-let BOARD_PX = 0; // side length of the 8×8 play area
-let TILE = 0;
-let BOARD_X = 0; // left inset (railing margin)
-let BOARD_Y = 0; // top of the play area
+let BOARD_PX = 0; // width of the NEAREST (bottom) row — the widest
+let BOARD_H = 0; // total board height on screen
+let TILE = 0; // base tile size (bottom row) — entity sizes derive from this
+let BOARD_Y = 0; // y of the far edge of the deck
 let RAIL = 0; // railing thickness
+
+/** Width of the far (top) edge relative to the near (bottom) edge. */
+const FAR_W = 0.78;
+/** Height of the far row relative to the near row. */
+const FAR_H = 0.68;
+
+/** rowEdgeT[r] = normalized (0..1) vertical position of horizontal grid line r. */
+let rowEdgeT: number[] = [];
+
+function computePerspective(): void {
+  // Far rows are vertically compressed: row r's height ∝ lerp(FAR_H, 1, r/7).
+  const heights: number[] = [];
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    heights.push(FAR_H + (1 - FAR_H) * (r / (BOARD_SIZE - 1)));
+  }
+  const total = heights.reduce((a, b) => a + b, 0);
+  rowEdgeT = [0];
+  let acc = 0;
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    acc += heights[r] / total;
+    rowEdgeT.push(acc);
+  }
+  rowEdgeT[BOARD_SIZE] = 1; // exactness against float drift
+}
 
 function resize(): void {
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
@@ -164,24 +197,77 @@ function resize(): void {
   HUD_H = Math.floor(VIEW_W * 0.15);
   RAIL = Math.floor(VIEW_W * 0.035);
   BOARD_PX = VIEW_W - RAIL * 2;
+  BOARD_H = Math.floor(BOARD_PX * 0.92); // slightly squashed = camera tilt
   TILE = BOARD_PX / BOARD_SIZE;
-  BOARD_X = RAIL;
   BOARD_Y = HUD_H + RAIL;
   const footer = Math.floor(VIEW_W * 0.1);
-  VIEW_H = HUD_H + RAIL + BOARD_PX + RAIL + footer;
+  VIEW_H = HUD_H + RAIL + BOARD_H + RAIL + footer;
 
   canvas.style.width = `${VIEW_W}px`;
   canvas.style.height = `${VIEW_H}px`;
   canvas.width = Math.floor(VIEW_W * dpr);
   canvas.height = Math.floor(VIEW_H * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  computePerspective();
 }
 window.addEventListener('resize', resize);
 resize();
 
-/** Center of tile (r, c) in logical pixels. */
-function tileCenter(r: number, c: number): { x: number; y: number } {
-  return { x: BOARD_X + c * TILE + TILE / 2, y: BOARD_Y + r * TILE + TILE / 2 };
+/** Normalized vertical position (0..1) for a continuous row coordinate 0..8. */
+function tAt(rr: number): number {
+  const clamped = Math.max(0, Math.min(BOARD_SIZE, rr));
+  const r0 = Math.min(BOARD_SIZE - 1, Math.floor(clamped));
+  const frac = clamped - r0;
+  return rowEdgeT[r0] + (rowEdgeT[r0 + 1] - rowEdgeT[r0]) * frac;
+}
+
+/** Board width at normalized depth t (0 = far edge, 1 = near edge). */
+function widthAt(t: number): number {
+  return BOARD_PX * (FAR_W + (1 - FAR_W) * t);
+}
+
+/** Continuous board coords (row 0..8, col 0..8) → screen pixels. */
+function rcToXY(rr: number, cc: number): { x: number; y: number } {
+  const t = tAt(rr);
+  return {
+    x: VIEW_W / 2 + (cc - BOARD_SIZE / 2) * (widthAt(t) / BOARD_SIZE),
+    y: BOARD_Y + BOARD_H * t,
+  };
+}
+
+/** Screen pixels → board cell, or null if outside the trapezoid. */
+function xyToRC(x: number, y: number): { r: number; c: number } | null {
+  const t = (y - BOARD_Y) / BOARD_H;
+  if (t < 0 || t > 1) return null;
+  let rr = BOARD_SIZE - 1;
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    if (t <= rowEdgeT[r + 1]) {
+      rr = r;
+      break;
+    }
+  }
+  const cc = (x - VIEW_W / 2) / (widthAt(t) / BOARD_SIZE) + BOARD_SIZE / 2;
+  if (cc < 0 || cc >= BOARD_SIZE) return null;
+  return { r: rr, c: Math.floor(cc) };
+}
+
+/** Tile width (px) at a row — the depth-scale for entities standing there. */
+function tileWidthAt(rr: number): number {
+  return widthAt(tAt(rr)) / BOARD_SIZE;
+}
+
+/** Trace the quad of cell (r, c) as a path (for fills/strokes/clips). */
+function tileQuadPath(r: number, c: number, inset = 0): void {
+  const p00 = rcToXY(r + inset, c + inset);
+  const p01 = rcToXY(r + inset, c + 1 - inset);
+  const p11 = rcToXY(r + 1 - inset, c + 1 - inset);
+  const p10 = rcToXY(r + 1 - inset, c + inset);
+  ctx.beginPath();
+  ctx.moveTo(p00.x, p00.y);
+  ctx.lineTo(p01.x, p01.y);
+  ctx.lineTo(p11.x, p11.y);
+  ctx.lineTo(p10.x, p10.y);
+  ctx.closePath();
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +280,6 @@ function ensureAudio(): void {
   try {
     if (!audio) {
       audio = new AudioContext();
-      // One second of white noise, reused for splash/hurt textures.
       noiseBuf = audio.createBuffer(1, audio.sampleRate, audio.sampleRate);
       const data = noiseBuf.getChannelData(0);
       for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
@@ -230,7 +315,6 @@ function tone(
   osc.stop(t0 + durMs / 1000 + 0.02);
 }
 
-/** A pitched noise burst (splashes, hits). */
 function noise(durMs: number, volume = 0.1, delayMs = 0, lowpassHz = 1200): void {
   if (!audio || !noiseBuf) return;
   const t0 = audio.currentTime + delayMs / 1000;
@@ -321,7 +405,7 @@ const state = {
 
   playerR: 0,
   playerC: 0,
-  facing: 1 as 1 | -1, // 1 = facing right, -1 = facing left
+  facing: 1 as 1 | -1,
   move: null as MoveAnim | null,
 
   hp: START_HP,
@@ -330,12 +414,10 @@ const state = {
   score: 0,
   relic: null as RelicId | null,
 
-  /** performance.now() when gameplay actually began (flood clock). */
   runStart: 0,
-  /** Set at game over so the flood freezes on the final frame. */
   runEnd: null as number | null,
-  /** Highest row index the flood has claimed damage for (event dedupe). */
-  floodDamageRow: -1,
+  /** Timestamp of the next chest-deep struggle tick (0 = not struggling yet). */
+  nextStruggleAt: 0,
 
   ending: null as Ending,
   particles: [] as Particle[],
@@ -349,28 +431,30 @@ const state = {
 };
 
 // ---------------------------------------------------------------------------
-// Flood model. Water claims rows top-down (row 0 = stern first) in real time.
-// `floodLevel` is a continuous row count: 0 → dry deck, 8 → fully submerged.
+// Flood model — the deck fills VERTICALLY, like a room filling with water.
+// One global water height rises from the floor the moment gameplay starts and
+// tops the survivor's head at FLOOD_TOTAL_S (20s), everywhere at once.
+// Chest-deep water makes you struggle (periodic HP loss); head-under is over.
 // ---------------------------------------------------------------------------
-function floodLevel(now: number): number {
+const WATER_HEAD = 0.9; // tile-units: the survivor's head top — drown height
+const WATER_CHEST = 0.45; // tile-units: struggling starts here
+const STRUGGLE_PERIOD_MS = 4000; // one HP every 4s while chest-deep
+
+/** Seconds of gameplay elapsed (frozen at game over). */
+function runElapsed(now: number): number {
   if (state.phase !== 'playing' && state.phase !== 'gameover') return 0;
   const end = state.runEnd ?? now;
-  const elapsed = (Math.min(now, end) - state.runStart) / 1000;
-  if (elapsed <= FLOOD_GRACE_S) return 0;
-  return Math.min(BOARD_SIZE, (elapsed - FLOOD_GRACE_S) / FLOOD_ROW_S);
+  return Math.max(0, (Math.min(now, end) - state.runStart) / 1000);
 }
 
-/** A row is "flooded" once the waterline has passed most of the way over it. */
-function isRowFlooded(row: number, now: number): boolean {
-  return floodLevel(now) >= row + 0.6;
+/** Current water height above the deck, in tile-units (same everywhere). */
+function waterHeightTiles(now: number): number {
+  return Math.min(WATER_HEAD, (runElapsed(now) / FLOOD_TOTAL_S) * WATER_HEAD);
 }
 
-/** Seconds until `row` floods (Infinity if > 99s away). */
-function secondsUntilFlood(row: number, now: number): number {
-  const end = state.runEnd ?? now;
-  const elapsed = (Math.min(now, end) - state.runStart) / 1000;
-  const floodsAt = FLOOD_GRACE_S + (row + 0.6) * FLOOD_ROW_S;
-  return Math.max(0, floodsAt - elapsed);
+/** Seconds until the water tops the survivor's head. */
+function secondsUntilDrown(now: number): number {
+  return Math.max(0, FLOOD_TOTAL_S - runElapsed(now));
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +490,7 @@ function startRun(practice: boolean): void {
   state.relic = null;
   state.runStart = 0;
   state.runEnd = null;
-  state.floodDamageRow = -1;
+  state.nextStruggleAt = 0;
   state.ending = null;
   state.particles = [];
   state.submitState = 'idle';
@@ -455,10 +539,9 @@ function handlePointer(clientX: number, clientY: number): void {
     }
     case 'playing': {
       if (state.move) return;
-      const c = Math.floor((x - BOARD_X) / TILE);
-      const r = Math.floor((y - BOARD_Y) / TILE);
-      if (r < 0 || r >= BOARD_SIZE || c < 0 || c >= BOARD_SIZE) return;
-      tryMove(r, c);
+      const cell = xyToRC(x, y);
+      if (!cell) return;
+      tryMove(cell.r, cell.c);
       return;
     }
     case 'gameover': {
@@ -529,11 +612,11 @@ window.addEventListener('keydown', (e) => {
 function chooseRelic(id: RelicId): void {
   state.relic = id;
   state.maxSteps = BASE_MAX_STEPS + (id === 'seaLegs' ? SEA_LEGS_BONUS : 0);
-  state.runStart = performance.now(); // the flood clock starts NOW
+  state.runStart = performance.now(); // the flood starts NOW — run!
   state.phase = 'playing';
 }
 
-function finishMove(now: number): void {
+function finishMove(): void {
   const mv = state.move!;
   state.move = null;
   state.playerR = mv.toR;
@@ -542,44 +625,44 @@ function finishMove(now: number): void {
 
   resolveTile(mv.toR, mv.toC);
 
-  // Wading: stepping into a flooded row costs 1 HP (the lifeboat is safe —
-  // it floats).
-  if (
-    state.hp > 0 &&
-    isRowFlooded(mv.toR, now) &&
-    state.grid![mv.toR][mv.toC] !== 'lifeboat'
-  ) {
-    const { x, y } = tileCenter(mv.toR, mv.toC);
-    state.hp -= 1;
-    sfx('splash');
-    burst(x, y, COLORS.breachFoam);
-    state.shake = { mag: TILE * 0.12, until: now + 220 };
-  }
-
   if (state.hp <= 0) return endRun('drowned');
   if (state.grid![mv.toR][mv.toC] === 'lifeboat') return endRun('escaped');
   if (state.stepsUsed >= state.maxSteps) return endRun('stranded');
 }
 
-/** Once per row: if the flood catches the tile you're standing on, you get hit. */
-function applyFloodCatchUp(now: number): void {
-  if (state.phase !== 'playing' || state.move) return;
-  const pr = Math.round(state.playerR);
-  if (isRowFlooded(pr, now) && state.floodDamageRow < pr) {
-    state.floodDamageRow = pr;
-    const { x, y } = tileCenter(pr, Math.round(state.playerC));
-    state.hp -= 1;
-    sfx('splash');
-    burst(x, y, COLORS.breachFoam);
-    state.shake = { mag: TILE * 0.15, until: now + 250 };
-    if (state.hp <= 0) endRun('drowned');
+/**
+ * The rising water's pressure on the survivor: once it's chest-deep you're
+ * fighting to stay up (1 HP every few seconds), and once it tops your head
+ * you drown outright. The only way out is the lifeboat.
+ */
+function applyWaterPressure(now: number): void {
+  if (state.phase !== 'playing') return;
+  const h = waterHeightTiles(now);
+  if (h >= WATER_HEAD) {
+    endRun('drowned');
+    return;
+  }
+  if (h >= WATER_CHEST) {
+    if (state.nextStruggleAt === 0) state.nextStruggleAt = now; // first gasp
+    if (now >= state.nextStruggleAt) {
+      state.nextStruggleAt = now + STRUGGLE_PERIOD_MS;
+      const { x, y } = rcToXY(
+        Math.round(state.playerR) + 0.5,
+        Math.round(state.playerC) + 0.5
+      );
+      state.hp -= 1;
+      sfx('splash');
+      burst(x, y, COLORS.breachFoam);
+      state.shake = { mag: TILE * 0.15, until: now + 250 };
+      if (state.hp <= 0) endRun('drowned');
+    }
   }
 }
 
 function resolveTile(r: number, c: number): void {
   const grid = state.grid!;
   const tile = grid[r][c];
-  const { x: cx, y: cy } = tileCenter(r, c);
+  const { x: cx, y: cy } = rcToXY(r + 0.5, c + 0.5);
 
   switch (tile) {
     case 'pearl': {
@@ -717,7 +800,7 @@ function frame(now: number): void {
       break;
     case 'playing':
       updateMove(now);
-      applyFloodCatchUp(now);
+      applyWaterPressure(now);
       drawGame(now);
       break;
     case 'gameover':
@@ -737,7 +820,7 @@ function updateMove(now: number): void {
   const e = t * t * (3 - 2 * t);
   state.playerR = mv.fromR + (mv.toR - mv.fromR) * e;
   state.playerC = mv.fromC + (mv.toC - mv.fromC) * e;
-  if (t >= 1) finishMove(now);
+  if (t >= 1) finishMove();
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +842,6 @@ function drawLoading(now: number): void {
 function drawTitle(now: number): void {
   paintSeaBackdrop(now);
 
-  // Moon + halo.
   const moonX = VIEW_W * 0.78;
   const moonY = VIEW_H * 0.1;
   const moonR = VIEW_W * 0.06;
@@ -785,7 +867,11 @@ function drawTitle(now: number): void {
   ctx.fillText('LAST VOYAGE', VIEW_W / 2, VIEW_H * 0.55 + bob);
   ctx.fillStyle = COLORS.hud;
   ctx.font = `500 ${Math.floor(VIEW_W * 0.036)}px sans-serif`;
-  ctx.fillText('Grab the pearls. Dodge the sharks. Reach the lifeboat.', VIEW_W / 2, VIEW_H * 0.61 + bob);
+  ctx.fillText(
+    `The deck floods in ${Math.round(FLOOD_TOTAL_S)} seconds. Reach the lifeboat.`,
+    VIEW_W / 2,
+    VIEW_H * 0.61 + bob
+  );
 
   if (state.error) {
     ctx.fillStyle = COLORS.danger;
@@ -976,16 +1062,20 @@ function drawRelicSelect(now: number): void {
   ctx.font = `500 ${Math.floor(VIEW_W * 0.028)}px sans-serif`;
   ctx.fillText('🦪 pearl +10   📦 crate +50   🦈 / 🌀 −1 HP   🚣 escape +100', VIEW_W / 2, cardY + VIEW_H * 0.015);
   ctx.fillStyle = COLORS.breachFoam;
-  ctx.font = `600 ${Math.floor(VIEW_W * 0.03)}px sans-serif`;
-  ctx.fillText('⚠️ The stern floods over time — keep moving or wade at your peril!', VIEW_W / 2, cardY + VIEW_H * 0.055);
+  ctx.font = `700 ${Math.floor(VIEW_W * 0.032)}px sans-serif`;
+  ctx.fillText(
+    `⚠️ The water starts rising the moment you choose — over your head in ${Math.round(FLOOD_TOTAL_S)}s. RUN!`,
+    VIEW_W / 2,
+    cardY + VIEW_H * 0.055
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Screen: the game.
-// Painter's order for the 2.5D look:
-//   sea backdrop → hull side → deck tiles (beveled) → move hints → railing →
-//   per-row: entities standing on tiles (+player inserted at its row) →
-//   flood water volume → particles → HUD → practice watermark
+// Painter's order for the 2.75D look:
+//   sea backdrop → hull side → perspective deck tiles → move hints → railing →
+//   per-row entities + player (near overlaps far) → flood volume → particles →
+//   HUD → practice watermark
 // ---------------------------------------------------------------------------
 function drawGame(now: number): void {
   paintSeaBackdrop(now);
@@ -1000,8 +1090,8 @@ function drawGame(now: number): void {
   drawHullSide(now);
   drawDeck(now);
   drawRailing();
-  drawEntitiesAndPlayer(now);
-  drawFloodWater(now);
+  drawEntitiesAndPlayer(now); // water strips are interleaved per row inside
+  drawFloodExtras(now);
   drawParticles(now);
 
   ctx.restore();
@@ -1015,62 +1105,86 @@ function drawGame(now: number): void {
     ctx.font = `800 ${Math.floor(VIEW_W * 0.13)}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.translate(VIEW_W / 2, BOARD_Y + BOARD_PX / 2);
+    const mid = rcToXY(4, 4);
+    ctx.translate(mid.x, mid.y);
     ctx.rotate(-0.35);
     ctx.fillText('PRACTICE', 0, 0);
     ctx.restore();
   }
 }
 
-/** The ship's hull cross-section below the deck — sells the "floating" depth. */
+/** The hull cross-section below the near edge of the deck. */
 function drawHullSide(now: number): void {
-  const y = BOARD_Y + BOARD_PX + RAIL;
+  const nearL = rcToXY(BOARD_SIZE, 0);
+  const nearR = rcToXY(BOARD_SIZE, BOARD_SIZE);
+  const y = nearL.y + RAIL;
   const h = VIEW_H - y;
   ctx.fillStyle = COLORS.hullSide;
   ctx.beginPath();
-  ctx.moveTo(BOARD_X - RAIL, y);
-  ctx.lineTo(BOARD_X + BOARD_PX + RAIL, y);
-  ctx.lineTo(BOARD_X + BOARD_PX + RAIL * 0.4, y + h);
-  ctx.lineTo(BOARD_X - RAIL * 0.4, y + h);
+  ctx.moveTo(nearL.x - RAIL, y);
+  ctx.lineTo(nearR.x + RAIL, y);
+  ctx.lineTo(nearR.x - RAIL * 0.6, y + h);
+  ctx.lineTo(nearL.x + RAIL * 0.6, y + h);
   ctx.closePath();
   ctx.fill();
-  // Waterline lapping against the hull.
   ctx.strokeStyle = 'rgba(127, 212, 255, 0.5)';
   ctx.lineWidth = 3;
   ctx.beginPath();
-  for (let x = BOARD_X - RAIL; x <= BOARD_X + BOARD_PX + RAIL; x += 10) {
+  for (let x = nearL.x - RAIL; x <= nearR.x + RAIL; x += 10) {
     const wy = y + h * 0.5 + Math.sin(x / 26 + now / 300) * 4;
-    if (x === BOARD_X - RAIL) ctx.moveTo(x, wy);
+    if (x === nearL.x - RAIL) ctx.moveTo(x, wy);
     else ctx.lineTo(x, wy);
   }
   ctx.stroke();
 }
 
-/** Beveled deck tiles — the chunky "GBA overworld" ground. */
+/** Perspective deck tiles: each cell is a trapezoid quad with bevel strips. */
 function drawDeck(now: number): void {
   for (let r = 0; r < BOARD_SIZE; r++) {
     for (let c = 0; c < BOARD_SIZE; c++) {
-      const x = BOARD_X + c * TILE;
-      const y = BOARD_Y + r * TILE;
-
-      // Base plank color, alternating for a subtle checker.
+      // Base plank fill.
       ctx.fillStyle = (r + c) % 2 === 0 ? COLORS.deckLight : COLORS.deckDark;
-      ctx.fillRect(x, y, TILE, TILE);
+      tileQuadPath(r, c);
+      ctx.fill();
 
-      // Bevel: light top edge + dark bottom edge give each tile thickness.
+      // Bevel: light strip near the far edge, dark strip near the near edge.
+      const q00 = rcToXY(r, c);
+      const q01 = rcToXY(r, c + 1);
+      const b00 = rcToXY(r + 0.12, c);
+      const b01 = rcToXY(r + 0.12, c + 1);
       ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
-      ctx.fillRect(x, y, TILE, TILE * 0.1);
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
-      ctx.fillRect(x, y + TILE * 0.88, TILE, TILE * 0.12);
+      ctx.beginPath();
+      ctx.moveTo(q00.x, q00.y);
+      ctx.lineTo(q01.x, q01.y);
+      ctx.lineTo(b01.x, b01.y);
+      ctx.lineTo(b00.x, b00.y);
+      ctx.closePath();
+      ctx.fill();
 
-      // Horizontal plank seams.
+      const d00 = rcToXY(r + 0.88, c);
+      const d01 = rcToXY(r + 0.88, c + 1);
+      const q10 = rcToXY(r + 1, c);
+      const q11 = rcToXY(r + 1, c + 1);
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.16)';
+      ctx.beginPath();
+      ctx.moveTo(d00.x, d00.y);
+      ctx.lineTo(d01.x, d01.y);
+      ctx.lineTo(q11.x, q11.y);
+      ctx.lineTo(q10.x, q10.y);
+      ctx.closePath();
+      ctx.fill();
+
+      // Plank seam + outline.
+      const m0 = rcToXY(r + 0.5, c);
+      const m1 = rcToXY(r + 0.5, c + 1);
       ctx.strokeStyle = COLORS.deckSeam;
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(x, y + TILE * 0.5);
-      ctx.lineTo(x + TILE, y + TILE * 0.5);
+      ctx.moveTo(m0.x, m0.y);
+      ctx.lineTo(m1.x, m1.y);
       ctx.stroke();
-      ctx.strokeRect(x + 0.5, y + 0.5, TILE - 1, TILE - 1);
+      tileQuadPath(r, c);
+      ctx.stroke();
     }
   }
 
@@ -1088,122 +1202,150 @@ function drawDeck(now: number): void {
     ctx.fillStyle = `rgba(103, 199, 239, ${pulse + 0.1})`;
     for (const [r, c] of nbrs) {
       if (r < 0 || r >= BOARD_SIZE || c < 0 || c >= BOARD_SIZE) continue;
-      ctx.fillRect(BOARD_X + c * TILE, BOARD_Y + r * TILE, TILE, TILE);
+      tileQuadPath(r, c);
+      ctx.fill();
     }
   }
 }
 
-/** Wooden railing frame with posts, wrapping the deck. */
+/** Railing drawn in perspective along the trapezoid's edges. */
 function drawRailing(): void {
-  const x0 = BOARD_X - RAIL;
-  const y0 = BOARD_Y - RAIL;
-  const outer = BOARD_PX + RAIL * 2;
+  const farL = rcToXY(0, 0);
+  const farR = rcToXY(0, BOARD_SIZE);
+  const nearL = rcToXY(BOARD_SIZE, 0);
+  const nearR = rcToXY(BOARD_SIZE, BOARD_SIZE);
+  const railFar = RAIL * FAR_W; // far rail is thinner (depth cue)
 
   ctx.fillStyle = COLORS.railWood;
-  // top, left, right, bottom rails
-  ctx.fillRect(x0, y0, outer, RAIL);
-  ctx.fillRect(x0, y0, RAIL, outer);
-  ctx.fillRect(x0 + outer - RAIL, y0, RAIL, outer);
-  ctx.fillRect(x0, y0 + outer - RAIL, outer, RAIL);
+  // Far rail.
+  ctx.fillRect(farL.x - railFar, farL.y - railFar, farR.x - farL.x + railFar * 2, railFar);
+  // Near rail.
+  ctx.fillRect(nearL.x - RAIL, nearL.y, nearR.x - nearL.x + RAIL * 2, RAIL);
+  // Slanted side rails (quads following the perspective edges).
+  ctx.beginPath();
+  ctx.moveTo(farL.x - railFar, farL.y - railFar);
+  ctx.lineTo(farL.x, farL.y);
+  ctx.lineTo(nearL.x, nearL.y + RAIL);
+  ctx.lineTo(nearL.x - RAIL, nearL.y + RAIL);
+  ctx.closePath();
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(farR.x + railFar, farR.y - railFar);
+  ctx.lineTo(farR.x, farR.y);
+  ctx.lineTo(nearR.x, nearR.y + RAIL);
+  ctx.lineTo(nearR.x + RAIL, nearR.y + RAIL);
+  ctx.closePath();
+  ctx.fill();
 
-  // Dark inner lip (the rail's shadow onto the deck).
-  ctx.strokeStyle = COLORS.railWoodDark;
-  ctx.lineWidth = 2;
-  ctx.strokeRect(BOARD_X - 1, BOARD_Y - 1, BOARD_PX + 2, BOARD_PX + 2);
-
-  // Rail posts along the top rail (little vertical nubs = depth cue).
+  // Posts along the far rail.
   ctx.fillStyle = COLORS.railWoodDark;
   for (let i = 0; i <= BOARD_SIZE; i++) {
-    const px = BOARD_X + i * TILE - RAIL * 0.15;
-    ctx.fillRect(px, y0 + RAIL * 0.15, RAIL * 0.3, RAIL * 0.7);
+    const p = rcToXY(0, i);
+    ctx.fillRect(p.x - railFar * 0.15, p.y - railFar * 0.85, railFar * 0.3, railFar * 0.7);
   }
+
+  // Inner lip around the deck.
+  ctx.strokeStyle = COLORS.railWoodDark;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(farL.x, farL.y);
+  ctx.lineTo(farR.x, farR.y);
+  ctx.lineTo(nearR.x, nearR.y);
+  ctx.lineTo(nearL.x, nearL.y);
+  ctx.closePath();
+  ctx.stroke();
 }
 
 /**
- * Entities + player, painted row by row (top to bottom) so that anything
- * standing on a lower tile overlaps what's behind it — the classic JRPG
- * painter's trick that makes a flat grid read as 3/4 perspective.
+ * Entities + player, painted row by row so near overlaps far, each drawn in
+ * its own translated + depth-scaled frame (origin = tile center, TILE units).
  */
 function drawEntitiesAndPlayer(now: number): void {
   const grid = state.grid!;
-  const playerRow = state.playerR; // fractional mid-lerp
+  const playerRow = state.playerR;
 
   for (let r = 0; r < BOARD_SIZE; r++) {
     for (let c = 0; c < BOARD_SIZE; c++) {
-      const { x: cx, y: cy } = tileCenter(r, c);
-      switch (grid[r][c]) {
+      const kind = grid[r][c];
+      if (kind === 'empty') continue;
+      const { x, y } = rcToXY(r + 0.5, c + 0.5);
+      const k = tileWidthAt(r + 0.5) / TILE; // depth scale
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.scale(k, k);
+      switch (kind) {
         case 'pearl':
-          drawPearl(cx, cy, now);
+          drawPearl(now);
           break;
         case 'crate':
-          drawCrate(cx, cy);
+          drawCrate();
           break;
         case 'shark':
-          drawShark(cx, cy, now);
+          drawShark(now);
           break;
         case 'breach':
-          drawBreach(cx, cy, now);
+          drawBreach(now);
           break;
         case 'lifeboat':
-          drawLifeboat(cx, cy, now);
+          drawLifeboat(now);
           break;
         default:
           break;
       }
+      ctx.restore();
     }
-    // Insert the player right after their own row so lower rows overlap them.
     if (Math.round(playerRow) === r) drawPlayer(now);
+    // This row's slice of the flood, AFTER its occupants: the water visibly
+    // rises from the deck floor up their bodies and over their heads, while
+    // nearer (not-yet-drawn) rows will correctly overlap it from the front.
+    drawWaterRowStrip(r, now);
   }
 }
 
-/** Elliptical contact shadow under a standing entity. */
-function shadow(cx: number, cy: number, w: number): void {
+/** Elliptical contact shadow (origin-relative, TILE units). */
+function shadow(w: number, dy = TILE * 0.3): void {
   ctx.fillStyle = COLORS.shadow;
   ctx.beginPath();
-  ctx.ellipse(cx, cy + TILE * 0.3, w, w * 0.32, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, dy, w, w * 0.32, 0, 0, Math.PI * 2);
   ctx.fill();
 }
 
-// --- Entity primitives (all standing ON their tiles, feet at ~cy+0.3*TILE) --
+// --- Entity primitives — all origin-relative so depth-scaling is one scale()
 
-function drawPearl(cx: number, cy: number, now: number): void {
-  const bob = Math.sin(now / 400 + cx) * TILE * 0.05;
+function drawPearl(now: number): void {
+  const bob = Math.sin(now / 400) * TILE * 0.05;
   const rad = TILE * 0.2;
-  const py = cy + TILE * 0.05 - bob;
-  shadow(cx, cy, rad * (1 - bob / TILE));
+  const py = TILE * 0.05 - bob;
+  shadow(rad * (1 - bob / TILE));
 
-  // Open shell beneath the pearl.
   ctx.fillStyle = '#d8b78f';
   ctx.beginPath();
-  ctx.ellipse(cx, cy + TILE * 0.22, rad * 1.35, rad * 0.55, 0, 0, Math.PI);
+  ctx.ellipse(0, TILE * 0.22, rad * 1.35, rad * 0.55, 0, 0, Math.PI);
   ctx.fill();
 
-  const g = ctx.createRadialGradient(cx - rad * 0.3, py - rad * 0.3, rad * 0.2, cx, py, rad);
+  const g = ctx.createRadialGradient(-rad * 0.3, py - rad * 0.3, rad * 0.2, 0, py, rad);
   g.addColorStop(0, '#ffffff');
   g.addColorStop(0.5, COLORS.pearl);
   g.addColorStop(1, COLORS.pearlCore);
   ctx.fillStyle = g;
   ctx.beginPath();
-  ctx.arc(cx, py, rad, 0, Math.PI * 2);
+  ctx.arc(0, py, rad, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = 'rgba(255,255,255,0.9)';
   ctx.beginPath();
-  ctx.arc(cx - rad * 0.35, py - rad * 0.35, rad * 0.2, 0, Math.PI * 2);
+  ctx.arc(-rad * 0.35, py - rad * 0.35, rad * 0.2, 0, Math.PI * 2);
   ctx.fill();
 }
 
-/** A 3D crate: top face + front face, like a mini isometric box. */
-function drawCrate(cx: number, cy: number): void {
+function drawCrate(): void {
   const s = TILE * 0.52;
   const topH = s * 0.38;
-  const x = cx - s / 2;
-  const frontY = cy - TILE * 0.02;
-  shadow(cx, cy, s * 0.55);
+  const x = -s / 2;
+  const frontY = -TILE * 0.02;
+  shadow(s * 0.55);
 
-  // Front face.
   ctx.fillStyle = COLORS.crateFront;
   ctx.fillRect(x, frontY, s, TILE * 0.32);
-  // Top face (lighter = light from above).
   ctx.fillStyle = COLORS.crateTop;
   ctx.beginPath();
   ctx.moveTo(x, frontY);
@@ -1213,7 +1355,6 @@ function drawCrate(cx: number, cy: number): void {
   ctx.closePath();
   ctx.fill();
 
-  // Banding.
   ctx.strokeStyle = COLORS.crateBand;
   ctx.lineWidth = Math.max(2, TILE * 0.035);
   ctx.strokeRect(x, frontY, s, TILE * 0.32);
@@ -1225,12 +1366,12 @@ function drawCrate(cx: number, cy: number): void {
   ctx.stroke();
 }
 
-function drawShark(cx: number, cy: number, now: number): void {
-  const sway = Math.sin(now / 300 + cy) * TILE * 0.05;
+function drawShark(now: number): void {
+  const sway = Math.sin(now / 300) * TILE * 0.05;
   const bodyR = TILE * 0.28;
-  shadow(cx + sway, cy, bodyR * 1.1);
+  shadow(bodyR * 1.1);
   ctx.save();
-  ctx.translate(cx + sway, cy + TILE * 0.02);
+  ctx.translate(sway, TILE * 0.02);
 
   ctx.fillStyle = COLORS.shark;
   ctx.beginPath();
@@ -1272,19 +1413,17 @@ function drawShark(cx: number, cy: number, now: number): void {
   ctx.restore();
 }
 
-function drawBreach(cx: number, cy: number, now: number): void {
+function drawBreach(now: number): void {
   const spin = now / 600;
   const spikes = 9;
   const outer = TILE * 0.3;
   const inner = TILE * 0.15;
-  // A breach is a hole — darken the tile beneath instead of a drop shadow.
   ctx.fillStyle = 'rgba(4, 18, 30, 0.45)';
   ctx.beginPath();
-  ctx.ellipse(cx, cy + TILE * 0.06, outer * 1.25, outer * 0.9, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, TILE * 0.06, outer * 1.25, outer * 0.9, 0, 0, Math.PI * 2);
   ctx.fill();
 
   ctx.save();
-  ctx.translate(cx, cy);
   ctx.rotate(spin);
   ctx.beginPath();
   for (let i = 0; i < spikes * 2; i++) {
@@ -1308,23 +1447,22 @@ function drawBreach(cx: number, cy: number, now: number): void {
   ctx.restore();
 }
 
-function drawLifeboat(cx: number, cy: number, now: number): void {
+function drawLifeboat(now: number): void {
   const bob = Math.sin(now / 350) * TILE * 0.03;
   const w = TILE * 0.68;
   const h = TILE * 0.34;
 
   const pulse = 0.5 + 0.5 * Math.sin(now / 350);
-  const glow = ctx.createRadialGradient(cx, cy, TILE * 0.1, cx, cy, TILE * 0.55);
+  const glow = ctx.createRadialGradient(0, 0, TILE * 0.1, 0, 0, TILE * 0.55);
   glow.addColorStop(0, `rgba(255, 107, 61, ${0.25 + pulse * 0.2})`);
   glow.addColorStop(1, 'rgba(255, 107, 61, 0)');
   ctx.fillStyle = glow;
-  ctx.fillRect(cx - TILE * 0.55, cy - TILE * 0.55, TILE * 1.1, TILE * 1.1);
+  ctx.fillRect(-TILE * 0.55, -TILE * 0.55, TILE * 1.1, TILE * 1.1);
 
-  shadow(cx, cy, w * 0.5);
+  shadow(w * 0.5);
   ctx.save();
-  ctx.translate(cx, cy + bob);
+  ctx.translate(0, bob);
 
-  // Hull with a visible side face (two-tone = 3/4 view).
   ctx.fillStyle = COLORS.lifeboat;
   ctx.beginPath();
   ctx.moveTo(-w / 2, -h * 0.15);
@@ -1362,15 +1500,11 @@ function drawLifeboat(cx: number, cy: number, now: number): void {
   ctx.restore();
 }
 
-/**
- * The survivor: a chibi character with head, orange life-vest, and little
- * legs — faces the direction of travel and hops while gliding between tiles.
- */
+/** The survivor — drawn at their (possibly mid-lerp) position, depth-scaled. */
 function drawPlayer(now: number): void {
-  const cx = BOARD_X + state.playerC * TILE + TILE / 2;
-  const cyBase = BOARD_Y + state.playerR * TILE + TILE / 2;
+  const { x, y } = rcToXY(state.playerR + 0.5, state.playerC + 0.5);
+  const k = tileWidthAt(state.playerR + 0.5) / TILE;
 
-  // Mid-move hop (sin arc over the lerp) or a gentle idle bob.
   let hop = 0;
   if (state.move) {
     const t = Math.min(1, (now - state.move.start) / MOVE_MS);
@@ -1378,32 +1512,30 @@ function drawPlayer(now: number): void {
   } else {
     hop = Math.max(0, Math.sin(now / 350)) * TILE * 0.02;
   }
-  const cy = cyBase - hop;
 
   const headR = TILE * 0.14;
   const bodyW = TILE * 0.3;
   const bodyH = TILE * 0.26;
 
-  shadow(cx, cyBase, TILE * 0.2 * (1 - hop / TILE));
-
   ctx.save();
-  ctx.translate(cx, cy);
-  ctx.scale(state.facing, 1); // flip horizontally to face travel direction
+  ctx.translate(x, y);
+  ctx.scale(k, k);
 
-  // Legs.
+  shadow(TILE * 0.2 * (1 - hop / TILE));
+  ctx.translate(0, -hop);
+  ctx.scale(state.facing, 1);
+
   const step = state.move ? Math.sin(now / 40) * TILE * 0.04 : 0;
   ctx.fillStyle = COLORS.pants;
   ctx.fillRect(-bodyW * 0.32, TILE * 0.12 + step, bodyW * 0.26, TILE * 0.14);
   ctx.fillRect(bodyW * 0.06, TILE * 0.12 - step, bodyW * 0.26, TILE * 0.14);
 
-  // Body (shirt) with vest overlay.
   ctx.fillStyle = COLORS.shirt;
   roundRect(-bodyW / 2, -bodyH * 0.4, bodyW, bodyH, bodyW * 0.25);
   ctx.fill();
   ctx.fillStyle = COLORS.vest;
   roundRect(-bodyW / 2, -bodyH * 0.4, bodyW, bodyH * 0.62, bodyW * 0.25);
   ctx.fill();
-  // Vest strap.
   ctx.strokeStyle = COLORS.lifeboatTrim;
   ctx.lineWidth = Math.max(1.5, TILE * 0.025);
   ctx.beginPath();
@@ -1411,7 +1543,6 @@ function drawPlayer(now: number): void {
   ctx.lineTo(bodyW * 0.28, -bodyH * 0.05);
   ctx.stroke();
 
-  // Head with a hint of a face (eye dot) on the leading side.
   ctx.fillStyle = COLORS.skin;
   ctx.beginPath();
   ctx.arc(0, -bodyH * 0.4 - headR * 0.9, headR, 0, Math.PI * 2);
@@ -1420,7 +1551,6 @@ function drawPlayer(now: number): void {
   ctx.beginPath();
   ctx.arc(headR * 0.42, -bodyH * 0.4 - headR, headR * 0.16, 0, Math.PI * 2);
   ctx.fill();
-  // Hair.
   ctx.fillStyle = '#5b4426';
   ctx.beginPath();
   ctx.arc(0, -bodyH * 0.4 - headR * 1.15, headR * 0.85, Math.PI, Math.PI * 2);
@@ -1430,76 +1560,139 @@ function drawPlayer(now: number): void {
 }
 
 /**
- * The flood — a translucent water VOLUME sliding down from the stern (top of
- * the board) in real time. Submerged tiles get a depth tint, a foam line
- * marks the moving edge, and caustic shimmers play over the surface.
+ * The flood — ONE horizontal water surface across the whole deck, rising
+ * VERTICALLY from the floor like a room filling up. Every tile shares the
+ * same water height h; each row's slice of the surface is that row's deck
+ * plane LIFTED by h (scaled to the row's perspective size so the plane
+ * recedes toward the vanishing point). Characters sink from the feet up:
+ * whatever stands taller than h pokes out crisp above the surface, the rest
+ * shows tinted through the translucent fill (each row's occupants are painted
+ * just before that row's water strip — see drawEntitiesAndPlayer).
  */
-function drawFloodWater(now: number): void {
-  const level = floodLevel(now); // 0..8 rows, continuous
-  if (level <= 0) {
-    return;
-  }
-  const edgeY = BOARD_Y + level * TILE;
-  const topY = BOARD_Y - RAIL;
-  const amp = TILE * 0.09;
-  const segs = 26;
 
-  // Water body with a vertical depth gradient (darker = deeper = older).
-  ctx.save();
-  ctx.beginPath();
-  ctx.moveTo(BOARD_X - RAIL, topY);
-  ctx.lineTo(BOARD_X + BOARD_PX + RAIL, topY);
-  ctx.lineTo(BOARD_X + BOARD_PX + RAIL, edgeY);
-  for (let i = segs; i >= 0; i--) {
-    const x = BOARD_X - RAIL + (i / segs) * (BOARD_PX + RAIL * 2);
-    const y = edgeY + Math.sin(now / 280 + i * 0.7) * amp;
-    ctx.lineTo(x, y);
-  }
-  ctx.closePath();
-  const grad = ctx.createLinearGradient(0, topY, 0, edgeY);
-  grad.addColorStop(0, 'rgba(9, 58, 89, 0.85)');
-  grad.addColorStop(0.7, 'rgba(23, 108, 153, 0.72)');
-  grad.addColorStop(1, 'rgba(103, 199, 239, 0.55)');
-  ctx.fillStyle = grad;
-  ctx.fill();
-  ctx.clip(); // keep shimmer + foam inside the water body
+/** Water depth in screen px above the deck at row coordinate rr. */
+function waterDepthPx(rr: number, now: number): number {
+  // Scale with the row's perspective size so far water looks far.
+  return waterHeightTiles(now) * tileWidthAt(rr);
+}
 
-  // Caustic shimmer: drifting bright sine ribbons.
-  ctx.strokeStyle = 'rgba(197, 233, 250, 0.18)';
-  ctx.lineWidth = 2;
-  for (let band = 0; band < 4; band++) {
-    const by = topY + ((edgeY - topY) * (band + 0.5)) / 4;
+/** Screen y of the water SURFACE at row coordinate rr (deck minus depth). */
+function waterSurfaceY(rr: number, now: number): number {
+  return BOARD_Y + BOARD_H * tAt(rr) - waterDepthPx(rr, now);
+}
+
+/** Left/right x of the water sheet (board edge + submerged rail) at rr. */
+function waterXL(rr: number): number {
+  return VIEW_W / 2 - widthAt(tAt(rr)) / 2 - RAIL * (FAR_W + (1 - FAR_W) * tAt(rr));
+}
+function waterXR(rr: number): number {
+  return VIEW_W / 2 + widthAt(tAt(rr)) / 2 + RAIL * (FAR_W + (1 - FAR_W) * tAt(rr));
+}
+
+/**
+ * One row's slice of the global water surface. Called from
+ * drawEntitiesAndPlayer IMMEDIATELY after that row's occupants so occlusion
+ * is correct: the water visibly climbs each character's body from the floor,
+ * and nearer rows' strips overlap from the front.
+ */
+function drawWaterRowStrip(r: number, now: number): void {
+  const h = waterHeightTiles(now);
+  if (h <= 0) return;
+
+  const surfY = (rr: number): number =>
+    waterSurfaceY(rr, now) + Math.sin(now / 320 + rr * 2.1) * TILE * 0.02;
+
+  // The slice as a stack of thin quads tracing the receding surface plane.
+  const S = 4;
+  const alpha = 0.4 + 0.35 * Math.min(1, h / WATER_HEAD);
+  ctx.fillStyle = `rgba(23, 108, 153, ${alpha.toFixed(3)})`;
+  for (let i = 0; i < S; i++) {
+    const rr0 = r + i / S;
+    const rr1 = r + (i + 1) / S;
     ctx.beginPath();
-    for (let x = BOARD_X - RAIL; x <= BOARD_X + BOARD_PX + RAIL; x += 12) {
-      const y = by + Math.sin(x / 30 + now / 400 + band * 2) * 5;
-      if (x === BOARD_X - RAIL) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
+    ctx.moveTo(waterXL(rr0), surfY(rr0));
+    ctx.lineTo(waterXR(rr0), surfY(rr0));
+    ctx.lineTo(waterXR(rr1), surfY(rr1));
+    ctx.lineTo(waterXL(rr1), surfY(rr1));
+    ctx.closePath();
+    ctx.fill();
   }
-  ctx.restore();
 
-  // Foam crest along the advancing edge.
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
+  // Caustic shimmer across the middle of this strip.
+  const rrMid = r + 0.5;
+  const yMid = surfY(rrMid);
+  ctx.strokeStyle = 'rgba(197, 233, 250, 0.16)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  let firstPt = true;
+  for (let x = waterXL(rrMid); x <= waterXR(rrMid); x += 12) {
+    const y = yMid + Math.sin(x / 28 + now / 380 + r) * 3;
+    if (firstPt) {
+      ctx.moveTo(x, y);
+      firstPt = false;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+}
+
+/**
+ * After all rows: the water's FRONT FACE at the near edge (the cross-section
+ * you watch climb — the clearest "filling vertically" cue), surface bubbles,
+ * and a danger vignette once the survivor is struggling.
+ */
+function drawFloodExtras(now: number): void {
+  const h = waterHeightTiles(now);
+  if (h <= 0) return;
+
+  // Front face: translucent wall from the near deck edge up to the surface.
+  const xl = waterXL(BOARD_SIZE);
+  const xr = waterXR(BOARD_SIZE);
+  const ySurf = waterSurfaceY(BOARD_SIZE, now);
+  const yDeckNear = BOARD_Y + BOARD_H + RAIL;
+  ctx.fillStyle = 'rgba(12, 70, 104, 0.72)';
+  ctx.fillRect(xl, ySurf, xr - xl, Math.max(0, yDeckNear - ySurf));
+
+  // Foam line along the front surface edge — the waterline that rises.
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
   ctx.lineWidth = 3;
   ctx.beginPath();
-  for (let i = 0; i <= segs; i++) {
-    const x = BOARD_X - RAIL + (i / segs) * (BOARD_PX + RAIL * 2);
-    const y = edgeY + Math.sin(now / 280 + i * 0.7) * amp;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+  let firstF = true;
+  for (let x = xl; x <= xr; x += 10) {
+    const y = ySurf + Math.sin(x / 24 + now / 280) * TILE * 0.04;
+    if (firstF) {
+      ctx.moveTo(x, y);
+      firstF = false;
+    } else {
+      ctx.lineTo(x, y);
+    }
   }
   ctx.stroke();
 
-  // Warning tint on the next row about to flood (last 3 seconds).
-  const nextRow = Math.floor(level + 0.4);
-  if (nextRow < BOARD_SIZE && state.phase === 'playing') {
-    const tLeft = secondsUntilFlood(nextRow, now);
-    if (tLeft < 3) {
-      const flash = 0.1 + 0.12 * Math.abs(Math.sin(now / 180));
-      ctx.fillStyle = `rgba(127, 212, 255, ${flash})`;
-      ctx.fillRect(BOARD_X, BOARD_Y + nextRow * TILE, BOARD_PX, TILE);
-    }
+  // Bobbing bubbles riding the surface.
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+  for (let i = 0; i < 6; i++) {
+    const rr = (i * 1.3 + now / 2600) % BOARD_SIZE;
+    const cc = (i * 2.7 + Math.sin(now / 900 + i) + BOARD_SIZE) % BOARD_SIZE;
+    const sx = VIEW_W / 2 + (cc - BOARD_SIZE / 2) * (widthAt(tAt(rr)) / BOARD_SIZE);
+    const sy = waterSurfaceY(rr, now) + Math.sin(now / 350 + i * 2) * 2;
+    const br = tileWidthAt(rr) * 0.045;
+    ctx.beginPath();
+    ctx.arc(sx, sy, br, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Danger vignette while chest-deep: the edges of the deck pulse red.
+  if (state.phase === 'playing' && h >= WATER_CHEST) {
+    const pulse = 0.08 + 0.08 * Math.abs(Math.sin(now / 220));
+    const g = ctx.createLinearGradient(0, HUD_H, 0, VIEW_H);
+    g.addColorStop(0, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
+    g.addColorStop(0.3, 'rgba(255, 97, 97, 0)');
+    g.addColorStop(0.7, 'rgba(255, 97, 97, 0)');
+    g.addColorStop(1, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
   }
 }
 
@@ -1553,19 +1746,23 @@ function drawHud(now: number): void {
   ctx.font = `600 ${Math.floor(HUD_H * 0.2)}px sans-serif`;
   ctx.fillText(`${left} ${left === 1 ? 'move' : 'moves'} left`, VIEW_W - pad, HUD_H * 0.72);
 
-  // Flood status, centered: grace countdown, then "row sinks in Xs".
+  // Flood ticker, centered: the water level and time until it tops your head.
   if (state.phase === 'playing') {
     ctx.textAlign = 'center';
-    const level = floodLevel(now);
-    const nextRow = Math.min(BOARD_SIZE - 1, Math.floor(level + 0.4));
-    const tLeft = secondsUntilFlood(nextRow, now);
-    ctx.fillStyle = level > 0 || tLeft < 6 ? COLORS.breachFoam : COLORS.hudDim;
-    ctx.font = `600 ${Math.floor(HUD_H * 0.19)}px sans-serif`;
-    const label =
-      level <= 0
-        ? `🌊 flooding in ${Math.ceil(secondsUntilFlood(0, now))}s`
-        : `🌊 row ${nextRow + 1} sinks in ${Math.ceil(tLeft)}s`;
-    ctx.fillText(label, VIEW_W / 2, HUD_H * 0.5);
+    const h = waterHeightTiles(now);
+    const tLeft = secondsUntilDrown(now);
+    const struggling = h >= WATER_CHEST;
+    const urgent = struggling && Math.floor(now / 220) % 2 === 0;
+    ctx.fillStyle = urgent ? COLORS.danger : COLORS.breachFoam;
+    ctx.font = `700 ${Math.floor(HUD_H * 0.2)}px sans-serif`;
+    const pct = Math.round((h / WATER_HEAD) * 100);
+    ctx.fillText(
+      struggling
+        ? `🌊 ${pct}% — DROWNING in ${tLeft.toFixed(1)}s`
+        : `🌊 water ${pct}% — overhead in ${Math.ceil(tLeft)}s`,
+      VIEW_W / 2,
+      HUD_H * 0.5
+    );
   }
 }
 
