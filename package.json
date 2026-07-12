@@ -1,0 +1,27 @@
+{
+  "name": "sinking-ship",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Last Voyage — a daily procedural 'escape the sinking ship' game built on the Devvit Web platform. Collect pearls, dodge sharks, reach the lifeboat. All visuals are drawn with the native HTML5 Canvas API.",
+  "scripts": {
+    "//": "The Devvit CLI orchestrates the client (vite) and server (vite/esbuild) builds.",
+    "build:client": "vite build --config vite.client.config.ts",
+    "build:server": "vite build --config vite.server.config.ts",
+    "build": "npm run build:client && npm run build:server",
+    "dev": "devvit playtest",
+    "deploy": "npm run build && devvit upload",
+    "launch": "npm run build && devvit publish",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@devvit/web": "latest",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "devvit": "latest",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0"
+  }
+}

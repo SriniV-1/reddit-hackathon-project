@@ -1,0 +1,55 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "sinking-ship",
+
+  "//": "------------------------------------------------------------------",
+  "// post": "Devvit Web serves a STATIC client bundle inside the Reddit post.",
+  "// post.dir": "Folder that holds the built client (html/js/css).",
+  "// post.entrypoints.default.entry": "The HTML file loaded in the post iframe.",
+  "// post.entrypoints.default.height": "'regular' | 'tall' — 'tall' gives us room for the canvas.",
+  "post": {
+    "dir": "dist/client",
+    "entrypoints": {
+      "default": {
+        "entry": "index.html",
+        "height": "tall"
+      }
+    }
+  },
+
+  "//": "------------------------------------------------------------------",
+  "// server": "The serverless backend. `entry` is the bundled Node handler.",
+  "// server.dir": "Folder that holds the built server bundle.",
+  "server": {
+    "dir": "dist/server",
+    "entry": "index.cjs"
+  },
+
+  "//": "------------------------------------------------------------------",
+  "// permissions": "Capabilities the app is allowed to use at runtime.",
+  "// permissions.redis": "Required for the daily board seed + faction leaderboard.",
+  "// permissions.reddit": "Required to read subredditName / userId from context.",
+  "permissions": {
+    "redis": true,
+    "reddit": true
+  },
+
+  "//": "------------------------------------------------------------------",
+  "// menu": "Adds a moderator menu action to spawn a fresh Vault Run post.",
+  "menu": {
+    "items": [
+      {
+        "label": "Launch a Last Voyage",
+        "location": "subreddit",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/create-post"
+      }
+    ]
+  },
+
+  "//": "------------------------------------------------------------------",
+  "// dev.subreddit": "Set this to YOUR test subreddit before running `devvit playtest`.",
+  "dev": {
+    "subreddit": "REPLACE_WITH_YOUR_TEST_SUBREDDIT"
+  }
+}

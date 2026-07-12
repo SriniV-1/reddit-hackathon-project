@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Lock the viewport so the canvas can own the whole post iframe. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Last Voyage</title>
+    <style>
+      /*
+       * The entire game is one <canvas>. We strip default margins, kill scroll,
+       * and paint a deep-ocean gradient behind the canvas so any letterboxing
+       * (from the fixed 1:1 game aspect) blends into the sea.
+       */
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: radial-gradient(circle at 50% 30%, #0b3a5b 0%, #041f33 60%, #01121f 100%);
+        /* Disable the mobile tap-highlight + long-press callout on the canvas. */
+        -webkit-tap-highlight-color: transparent;
+        -webkit-touch-callout: none;
+        user-select: none;
+        touch-action: none;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+
+      #stage {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+      }
+
+      /* The canvas is sized/retina-scaled in JS; here we just center it. */
+      #game {
+        display: block;
+        max-width: 100%;
+        max-height: 100%;
+        cursor: pointer;
+        touch-action: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <canvas id="game"></canvas>
+    </div>
+
+    <!-- Vite compiles + inlines this TypeScript entry at build time. -->
+    <script type="module" src="./app.ts"></script>
+  </body>
+</html>

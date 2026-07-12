@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output (Devvit bundles the client + server into dist/)
+dist/
+.turbo/
+
+# Devvit local state
+.devvit/
+*.log
+
+# Env / secrets
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
