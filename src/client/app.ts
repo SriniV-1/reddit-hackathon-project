@@ -1341,17 +1341,34 @@ function drawEntitiesAndPlayer(now: number): void {
 
     // 2. This row's slice of the rising water — covers the deck-bound.
     drawWaterRowStrip(r, now);
+    drawUnderwaterGridRow(r, now); // keeps tiles readable as the wood drowns
 
     // 3. Buoyant things, ON TOP of the surface. Their contact shadows stay
     //    ON THE DECK and fade as they rise — the widening gap between sprite
     //    and shadow makes the climbing level readable on every single tile.
     const liftFrac = Math.min(1, waterHeightTiles(now) / WATER_HEAD);
+    const foamA = Math.min(1, (lift / TILE) / 0.2) * 0.5;
     const floatDraw = (fr: number, fc: number, shadowW: number, fn: () => void, liftMul = 1): void => {
       ctx.save();
       ctx.globalAlpha = Math.max(0.15, 1 - 0.6 * liftFrac);
       drawAt(fr, fc, () => shadow(shadowW));
       ctx.restore();
-      drawAt(fr, fc, fn, -lift * liftMul);
+      drawAt(
+        fr,
+        fc,
+        () => {
+          fn();
+          // Foam ring where the floater sits in the surface.
+          if (foamA > 0.04) {
+            ctx.strokeStyle = `rgba(235, 250, 255, ${foamA.toFixed(3)})`;
+            ctx.lineWidth = Math.max(1.2, TILE * 0.028);
+            ctx.beginPath();
+            ctx.ellipse(0, TILE * 0.3, shadowW * 1.25, shadowW * 0.42, 0, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+        },
+        -lift * liftMul
+      );
     };
     for (let c = 0; c < BOARD_SIZE; c++) {
       switch (grid[r][c]) {
@@ -1787,8 +1804,8 @@ function mixRgba(
   return `rgba(${r}, ${g}, ${bl}, ${alpha.toFixed(3)})`;
 }
 
-const WATER_NEAR: readonly [number, number, number] = [36, 152, 196]; // lagoon
-const WATER_FAR: readonly [number, number, number] = [6, 44, 76]; // abyss
+const WATER_NEAR: readonly [number, number, number] = [40, 160, 205]; // lagoon
+const WATER_FAR: readonly [number, number, number] = [8, 52, 88]; // abyss
 
 /**
  * One row's slice of the global water surface. Called from
@@ -1801,9 +1818,10 @@ function drawWaterRowStrip(r: number, now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
 
-  // Starts as a barely-there film so the wood still reads early game, then
-  // deepens on a curve — the color change IS the story of the sink.
-  const alpha = 0.05 + 0.6 * Math.pow(Math.min(1, h / WATER_HEAD), 1.15);
+  // Starts as a barely-there film, then the water WINS the floor: by the
+  // deep phase it is nearly opaque and the wood is gone — the glowing
+  // underwater grid (drawn right after each strip) keeps the board playable.
+  const alpha = Math.min(0.86, 0.06 + 0.8 * Math.pow(Math.min(1, h / WATER_HEAD), 1.2));
   const S = 4;
   for (let i = 0; i < S; i++) {
     const rr0 = r + i / S;
@@ -1817,6 +1835,23 @@ function drawWaterRowStrip(r: number, now: number): void {
     ctx.lineTo(waterXL(rr1), liveSurfaceY(rr1, now));
     ctx.closePath();
     ctx.fill();
+  }
+}
+
+/**
+ * As the water turns opaque and the wood disappears, a faint cyan grid glows
+ * through from the drowned deck so the game stays perfectly playable — and it
+ * doubles as a depth cue: grid fading in = wood going under.
+ */
+function drawUnderwaterGridRow(r: number, now: number): void {
+  const h = waterHeightTiles(now);
+  const a = Math.max(0, Math.min(1, (h - 0.28) / 0.55)) * 0.24;
+  if (a <= 0.01) return;
+  ctx.strokeStyle = `rgba(140, 220, 255, ${a.toFixed(3)})`;
+  ctx.lineWidth = 1;
+  for (let c = 0; c < BOARD_SIZE; c++) {
+    tileQuadPath(r, c);
+    ctx.stroke();
   }
 }
 
@@ -1995,10 +2030,67 @@ function drawFloodExtras(now: number): void {
   meniscus(ySurf, xl, xr, 1);
   meniscus(liveSurfaceY(0, now), waterXL(0), waterXR(0), 0.45);
 
+  drawRailFoam(now, h);
+  drawWaveSparkles(now, h);
   updateAndDrawRipples(now, h);
   updateAndDrawBubbles(now, h);
   drawSurfaceGlints(now, h);
   drawMotes(now);
+}
+
+/**
+ * The classic cartoon-water read: chunky drifting wave glints (small arcs)
+ * scattered across the ENTIRE surface. This is what makes the floor itself
+ * scream "water" at a glance — density and brightness climb with the level.
+ */
+function drawWaveSparkles(now: number, h: number): void {
+  const vis = Math.min(1, h / 0.25) * (0.55 + 0.45 * Math.min(1, h / WATER_HEAD));
+  if (vis <= 0.03) return;
+  for (let i = 0; i < 42; i++) {
+    const speed = 0.25 + 0.5 * hash01(i + 11);
+    const rr = (hash01(i) * BOARD_SIZE + (now / 7000) * speed * BOARD_SIZE) % BOARD_SIZE;
+    const cc = (hash01(i + 91) * BOARD_SIZE + (now / 11000) * BOARD_SIZE * 0.35) % BOARD_SIZE;
+    const tw = tileWidthAt(rr);
+    const x = VIEW_W / 2 + (cc - BOARD_SIZE / 2) * (widthAt(tAt(rr)) / BOARD_SIZE);
+    const y = liveSurfaceY(rr, now);
+    const flick = 0.5 + 0.5 * Math.sin(now / 600 + i * 2.1);
+    const a = vis * (0.16 + 0.3 * flick);
+    if (a < 0.04) continue;
+    const w = tw * (0.13 + 0.12 * hash01(i + 31));
+    ctx.strokeStyle = `rgba(215, 245, 255, ${a.toFixed(3)})`;
+    ctx.lineWidth = Math.max(1.3, tw * 0.05);
+    ctx.beginPath();
+    ctx.arc(x, y, w, Math.PI * 0.12, Math.PI * 0.88); // the little "wave smile"
+    ctx.stroke();
+  }
+}
+
+/**
+ * Foam where the water meets the ship's sides — the surface boundary is
+ * outlined in white all the way around the board, not just at the front.
+ */
+function drawRailFoam(now: number, h: number): void {
+  const a = Math.min(1, h / 0.18) * 0.42;
+  if (a <= 0.03) return;
+  ctx.strokeStyle = `rgba(240, 252, 255, ${a.toFixed(3)})`;
+  ctx.lineWidth = 2;
+  for (const side of [-1, 1] as const) {
+    ctx.beginPath();
+    let first = true;
+    const N = 16;
+    for (let i = 0; i <= N; i++) {
+      const rr = (i / N) * BOARD_SIZE;
+      const x = VIEW_W / 2 + side * (widthAt(tAt(rr)) / 2);
+      const y = liveSurfaceY(rr, now) + Math.sin(now / 260 + rr * 2.4 + side) * TILE * 0.015;
+      if (first) {
+        ctx.moveTo(x, y);
+        first = false;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  }
 }
 
 /**
