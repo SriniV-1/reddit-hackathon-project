@@ -1092,6 +1092,7 @@ function drawGame(now: number): void {
   drawRailing();
   drawEntitiesAndPlayer(now); // water strips are interleaved per row inside
   drawFloodExtras(now);
+  drawDepthDarkness(now); // the deeper it gets, the darker the world
   drawParticles(now);
 
   ctx.restore();
@@ -1297,7 +1298,7 @@ function drawEntitiesAndPlayer(now: number): void {
           drawAt(r, c, () => drawPearl(now), -lift);
           break;
         case 'crate':
-          drawAt(r, c, () => drawCrate(), -lift);
+          drawAt(r, c, () => drawCrate(now), -lift);
           break;
         case 'shark':
           // A shark swims: body just under the surface, fin above it.
@@ -1327,6 +1328,7 @@ function drawPearl(now: number): void {
   const bob = Math.sin(now / 400) * TILE * 0.05;
   const rad = TILE * 0.2;
   const py = TILE * 0.05 - bob;
+  glowHalo(now, '159, 232, 255', TILE * 0.5, 0.55); // deep-water bioluminescence
   shadow(rad * (1 - bob / TILE));
 
   ctx.fillStyle = '#d8b78f';
@@ -1348,11 +1350,12 @@ function drawPearl(now: number): void {
   ctx.fill();
 }
 
-function drawCrate(): void {
+function drawCrate(now: number): void {
   const s = TILE * 0.52;
   const topH = s * 0.38;
   const x = -s / 2;
   const frontY = -TILE * 0.02;
+  glowHalo(now, '255, 210, 63', TILE * 0.5, 0.5); // deep-water bioluminescence
   shadow(s * 0.55);
 
   ctx.fillStyle = COLORS.crateFront;
@@ -1380,6 +1383,7 @@ function drawCrate(): void {
 function drawShark(now: number): void {
   const sway = Math.sin(now / 300) * TILE * 0.05;
   const bodyR = TILE * 0.28;
+  glowHalo(now, '255, 97, 97', TILE * 0.55, 0.4); // danger reads red in the dark
   shadow(bodyR * 1.1);
   ctx.save();
   ctx.translate(sway, TILE * 0.02);
@@ -1429,6 +1433,7 @@ function drawBreach(now: number): void {
   const spikes = 9;
   const outer = TILE * 0.3;
   const inner = TILE * 0.15;
+  glowHalo(now, '127, 212, 255', TILE * 0.5, 0.35); // deep-water bioluminescence
   ctx.fillStyle = 'rgba(4, 18, 30, 0.45)';
   ctx.beginPath();
   ctx.ellipse(0, TILE * 0.06, outer * 1.25, outer * 0.9, 0, 0, Math.PI * 2);
@@ -1463,6 +1468,8 @@ function drawLifeboat(now: number): void {
   const w = TILE * 0.68;
   const h = TILE * 0.34;
 
+  // The beacon burns brightest in the deep — your way out.
+  glowHalo(now, '255, 107, 61', TILE * 0.75, 0.65);
   const pulse = 0.5 + 0.5 * Math.sin(now / 350);
   const glow = ctx.createRadialGradient(0, 0, TILE * 0.1, 0, 0, TILE * 0.55);
   glow.addColorStop(0, `rgba(255, 107, 61, ${0.25 + pulse * 0.2})`);
@@ -1532,6 +1539,7 @@ function drawPlayer(now: number): void {
   ctx.translate(x, y);
   ctx.scale(k, k);
 
+  glowHalo(now, '47, 168, 255', TILE * 0.65, 0.55); // find yourself in the dark
   shadow(TILE * 0.2 * (1 - hop / TILE));
   ctx.translate(0, -hop);
   ctx.scale(state.facing, 1);
@@ -1582,7 +1590,7 @@ function drawPlayer(now: number): void {
     const yDeckLocal = TILE * 0.3; // the deck plane at the feet
     const yLine = yDeckLocal - h * TILE; // local waterline height
     // The water column in front of the body.
-    ctx.fillStyle = 'rgba(23, 108, 153, 0.45)';
+    ctx.fillStyle = 'rgba(13, 74, 110, 0.55)';
     ctx.fillRect(-TILE * 0.46, yLine, TILE * 0.92, yDeckLocal - yLine + TILE * 0.12);
     // Foam lapping around them at the waterline.
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
@@ -1625,6 +1633,30 @@ function waterXR(rr: number): number {
   return VIEW_W / 2 + widthAt(tAt(rr)) / 2 + RAIL * (FAR_W + (1 - FAR_W) * tAt(rr));
 }
 
+/** 0 → shallow … 1 → water at head height: drives the deep-water effects. */
+function depthGlow(now: number): number {
+  const h = waterHeightTiles(now);
+  return Math.max(0, Math.min(1, (h - WATER_CHEST) / (WATER_HEAD - WATER_CHEST)));
+}
+
+/**
+ * Bioluminescent halo behind an entity once the deck is deep underwater.
+ * The world darkens as it sinks, so everything that matters starts to GLOW —
+ * the last seconds stay readable and look properly abyssal. Drawn in the
+ * entity's local frame, centered on the origin.
+ */
+function glowHalo(now: number, rgb: string, radius: number, strength = 0.5): void {
+  const g = depthGlow(now);
+  if (g <= 0.02) return;
+  const pulse = 0.75 + 0.25 * Math.sin(now / 300 + radius);
+  const a = strength * g * pulse;
+  const grad = ctx.createRadialGradient(0, 0, radius * 0.12, 0, 0, radius);
+  grad.addColorStop(0, `rgba(${rgb}, ${a.toFixed(3)})`);
+  grad.addColorStop(1, `rgba(${rgb}, 0)`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(-radius, -radius, radius * 2, radius * 2);
+}
+
 /**
  * One row's slice of the global water surface. Called from
  * drawEntitiesAndPlayer IMMEDIATELY after that row's occupants so occlusion
@@ -1642,8 +1674,8 @@ function drawWaterRowStrip(r: number, now: number): void {
   // Alpha ramps hard with depth: barely-there film at first, dense blue when
   // it's over your head — shallow water must NOT read as a solid tint.
   const S = 4;
-  const alpha = 0.1 + 0.42 * Math.min(1, h / WATER_HEAD);
-  ctx.fillStyle = `rgba(23, 108, 153, ${alpha.toFixed(3)})`;
+  const alpha = 0.16 + 0.55 * Math.min(1, h / WATER_HEAD);
+  ctx.fillStyle = `rgba(13, 74, 110, ${alpha.toFixed(3)})`;
   for (let i = 0; i < S; i++) {
     const rr0 = r + i / S;
     const rr1 = r + (i + 1) / S;
@@ -1692,8 +1724,8 @@ function drawFloodExtras(now: number): void {
   const ySurf = waterSurfaceY(BOARD_SIZE, now);
   const yDeckNear = BOARD_Y + BOARD_H + RAIL;
   const wall = ctx.createLinearGradient(0, ySurf, 0, yDeckNear);
-  wall.addColorStop(0, 'rgba(56, 140, 185, 0.85)');
-  wall.addColorStop(1, 'rgba(8, 46, 72, 0.9)');
+  wall.addColorStop(0, 'rgba(40, 120, 165, 0.88)');
+  wall.addColorStop(1, 'rgba(4, 30, 50, 0.94)');
   ctx.fillStyle = wall;
   ctx.fillRect(xl, ySurf, xr - xl, Math.max(0, yDeckNear - ySurf));
 
@@ -1745,16 +1777,33 @@ function drawFloodExtras(now: number): void {
   }
 
   // Danger vignette while chest-deep: the edges of the deck pulse red.
-  if (state.phase === 'playing' && h >= WATER_CHEST) {
-    const pulse = 0.08 + 0.08 * Math.abs(Math.sin(now / 220));
-    const g = ctx.createLinearGradient(0, HUD_H, 0, VIEW_H);
-    g.addColorStop(0, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
-    g.addColorStop(0.3, 'rgba(255, 97, 97, 0)');
-    g.addColorStop(0.7, 'rgba(255, 97, 97, 0)');
-    g.addColorStop(1, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
-    ctx.fillStyle = g;
-    ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
-  }
+  drawDangerVignette(now, h);
+}
+
+/**
+ * The scene sinks into the abyss: a darkness overlay whose strength climbs
+ * steeply with the water level. Under it, the glowHalo()s on every relevant
+ * entity are what keep the board readable — dark world, glowing things.
+ */
+function drawDepthDarkness(now: number): void {
+  const h = waterHeightTiles(now);
+  if (h <= 0) return;
+  const dark = 0.55 * Math.pow(h / WATER_HEAD, 1.4);
+  ctx.fillStyle = `rgba(1, 10, 22, ${dark.toFixed(3)})`;
+  ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
+}
+
+/** Red pulse at the deck edges once the survivor is struggling. */
+function drawDangerVignette(now: number, h: number): void {
+  if (state.phase !== 'playing' || h < WATER_CHEST) return;
+  const pulse = 0.08 + 0.08 * Math.abs(Math.sin(now / 220));
+  const g = ctx.createLinearGradient(0, HUD_H, 0, VIEW_H);
+  g.addColorStop(0, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
+  g.addColorStop(0.3, 'rgba(255, 97, 97, 0)');
+  g.addColorStop(0.7, 'rgba(255, 97, 97, 0)');
+  g.addColorStop(1, `rgba(255, 97, 97, ${pulse.toFixed(3)})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
 }
 
 function drawParticles(now: number): void {
