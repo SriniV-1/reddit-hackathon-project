@@ -403,6 +403,14 @@ interface Bubble {
   phase: number; // wobble offset
 }
 
+/** An expanding ripple ring on the water surface. */
+interface Ripple {
+  rr: number;
+  cc: number;
+  born: number;
+  dur: number;
+}
+
 const state = {
   phase: 'loading' as Phase,
   error: '',
@@ -432,6 +440,7 @@ const state = {
   ending: null as Ending,
   particles: [] as Particle[],
   bubbles: [] as Bubble[],
+  ripples: [] as Ripple[],
   shake: { mag: 0, until: 0 },
 
   submitState: 'idle' as 'idle' | 'sending' | 'done' | 'error',
@@ -525,6 +534,7 @@ function startRun(practice: boolean): void {
   state.ending = null;
   state.particles = [];
   state.bubbles = [];
+  state.ripples = [];
   state.submitState = 'idle';
   state.submit = null;
   state.submitMsg = '';
@@ -1123,6 +1133,7 @@ function drawGame(now: number): void {
   drawDeck(now);
   drawDeckCaustics(now); // dancing light on the drowned planks (under entities)
   drawRailing();
+  drawRefraction(now); // the submerged deck itself wobbles like liquid
   drawEntitiesAndPlayer(now); // water strips are interleaved per row inside
   drawFloodExtras(now); // front wall, meniscus, bubbles, glints, motes
   drawDepthFog(now); // distance-graded darkness — the world sinks toward black
@@ -1331,21 +1342,31 @@ function drawEntitiesAndPlayer(now: number): void {
     // 2. This row's slice of the rising water — covers the deck-bound.
     drawWaterRowStrip(r, now);
 
-    // 3. Buoyant things, ON TOP of the surface.
+    // 3. Buoyant things, ON TOP of the surface. Their contact shadows stay
+    //    ON THE DECK and fade as they rise — the widening gap between sprite
+    //    and shadow makes the climbing level readable on every single tile.
+    const liftFrac = Math.min(1, waterHeightTiles(now) / WATER_HEAD);
+    const floatDraw = (fr: number, fc: number, shadowW: number, fn: () => void, liftMul = 1): void => {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0.15, 1 - 0.6 * liftFrac);
+      drawAt(fr, fc, () => shadow(shadowW));
+      ctx.restore();
+      drawAt(fr, fc, fn, -lift * liftMul);
+    };
     for (let c = 0; c < BOARD_SIZE; c++) {
       switch (grid[r][c]) {
         case 'pearl':
-          drawAt(r, c, () => drawPearl(now), -lift);
+          floatDraw(r, c, TILE * 0.2, () => drawPearl(now));
           break;
         case 'crate':
-          drawAt(r, c, () => drawCrate(now), -lift);
+          floatDraw(r, c, TILE * 0.29, () => drawCrate(now));
           break;
         case 'shark':
           // A shark swims: body just under the surface, fin above it.
-          drawAt(r, c, () => drawShark(now), -lift * 0.85);
+          floatDraw(r, c, TILE * 0.31, () => drawShark(now), 0.85);
           break;
         case 'lifeboat':
-          drawAt(r, c, () => drawLifeboat(now), -lift);
+          floatDraw(r, c, TILE * 0.34, () => drawLifeboat(now));
           break;
         default:
           break;
@@ -1369,7 +1390,6 @@ function drawPearl(now: number): void {
   const rad = TILE * 0.2;
   const py = TILE * 0.05 - bob;
   glowHalo(now, '159, 232, 255', TILE * 0.5, 0.55); // deep-water bioluminescence
-  shadow(rad * (1 - bob / TILE));
 
   ctx.fillStyle = '#d8b78f';
   ctx.beginPath();
@@ -1396,7 +1416,6 @@ function drawCrate(now: number): void {
   const x = -s / 2;
   const frontY = -TILE * 0.02;
   glowHalo(now, '255, 210, 63', TILE * 0.5, 0.5); // deep-water bioluminescence
-  shadow(s * 0.55);
 
   ctx.fillStyle = COLORS.crateFront;
   ctx.fillRect(x, frontY, s, TILE * 0.32);
@@ -1424,7 +1443,6 @@ function drawShark(now: number): void {
   const sway = Math.sin(now / 300) * TILE * 0.05;
   const bodyR = TILE * 0.28;
   glowHalo(now, '255, 97, 97', TILE * 0.55, 0.4); // danger reads red in the dark
-  shadow(bodyR * 1.1);
   ctx.save();
   ctx.translate(sway, TILE * 0.02);
 
@@ -1517,7 +1535,6 @@ function drawLifeboat(now: number): void {
   ctx.fillStyle = glow;
   ctx.fillRect(-TILE * 0.55, -TILE * 0.55, TILE * 1.1, TILE * 1.1);
 
-  shadow(w * 0.5);
   ctx.save();
   ctx.translate(0, bob);
 
@@ -1804,6 +1821,42 @@ function drawWaterRowStrip(r: number, now: number): void {
 }
 
 /**
+ * Screen-space refraction: re-blit the just-drawn deck in thin horizontal
+ * slices, each displaced sideways by interfering sine waves whose amplitude
+ * grows with the water level. The BOARD ITSELF visibly wavers like it's under
+ * moving water — the single strongest "this whole surface is submerged" cue.
+ */
+function drawRefraction(now: number): void {
+  const h = waterHeightTiles(now);
+  if (h <= 0.04) return;
+  const dpr = canvas.width / VIEW_W;
+  const top = BOARD_Y - RAIL;
+  const bottom = BOARD_Y + BOARD_H;
+  const slices = 30;
+  const sliceH = (bottom - top) / slices;
+  const strength = Math.min(1, h / 0.5); // ramps in over the first half
+  for (let i = 0; i < slices; i++) {
+    const sy = top + i * sliceH;
+    const off =
+      (Math.sin(now / 420 + i * 0.55) + Math.sin(now / 260 - i * 0.35) * 0.5) *
+      TILE *
+      0.035 *
+      strength;
+    ctx.drawImage(
+      canvas,
+      0,
+      sy * dpr,
+      canvas.width,
+      Math.max(1, sliceH * dpr),
+      off,
+      sy,
+      VIEW_W,
+      sliceH
+    );
+  }
+}
+
+/**
  * Caustic light dancing on the submerged deck — two interfering wave lattices
  * drawn UNDER the entities, clipped to the board trapezoid. The classic
  * "swimming-pool floor" shimmer that instantly reads as water over wood.
@@ -1942,9 +1995,47 @@ function drawFloodExtras(now: number): void {
   meniscus(ySurf, xl, xr, 1);
   meniscus(liveSurfaceY(0, now), waterXL(0), waterXR(0), 0.45);
 
+  updateAndDrawRipples(now, h);
   updateAndDrawBubbles(now, h);
   drawSurfaceGlints(now, h);
   drawMotes(now);
+}
+
+/**
+ * Ripple rings blooming at random spots across the WHOLE surface — perspective
+ * -squashed expanding ellipses that fade as they grow. Liquid activity on the
+ * board itself, not just at its edges.
+ */
+function updateAndDrawRipples(now: number, h: number): void {
+  if (state.phase === 'playing' && h > 0.05 && state.ripples.length < 8 && Math.random() < 0.12) {
+    state.ripples.push({
+      rr: Math.random() * BOARD_SIZE,
+      cc: Math.random() * BOARD_SIZE,
+      born: now,
+      dur: 1100 + Math.random() * 700,
+    });
+  }
+
+  state.ripples = state.ripples.filter((rp) => now - rp.born < rp.dur);
+  for (const rp of state.ripples) {
+    const p = (now - rp.born) / rp.dur;
+    const tw = tileWidthAt(rp.rr);
+    const x = VIEW_W / 2 + (rp.cc - BOARD_SIZE / 2) * (widthAt(tAt(rp.rr)) / BOARD_SIZE);
+    const y = liveSurfaceY(rp.rr, now);
+    const rx = tw * (0.12 + 0.6 * p);
+    ctx.strokeStyle = `rgba(220, 245, 255, ${((1 - p) * 0.4).toFixed(3)})`;
+    ctx.lineWidth = Math.max(1, 2.2 * (1 - p));
+    ctx.beginPath();
+    ctx.ellipse(x, y, rx, rx * 0.35, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    // Inner echo ring for the fresh ripples.
+    if (p < 0.55) {
+      ctx.strokeStyle = `rgba(220, 245, 255, ${((0.55 - p) * 0.35).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.ellipse(x, y, rx * 0.55, rx * 0.19, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
 }
 
 /** Deterministic 0..1 hash for stable pseudo-random FX placement. */
