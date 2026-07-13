@@ -393,16 +393,6 @@ interface MoveAnim {
   start: number;
 }
 
-/** A bubble rising through the water volume from deck to surface. */
-interface Bubble {
-  rr: number; // board row (continuous)
-  cc: number; // board col (continuous)
-  born: number;
-  dur: number;
-  size: number;
-  phase: number; // wobble offset
-}
-
 /** An expanding ripple ring on the water surface. */
 interface Ripple {
   rr: number;
@@ -439,7 +429,6 @@ const state = {
 
   ending: null as Ending,
   particles: [] as Particle[],
-  bubbles: [] as Bubble[],
   ripples: [] as Ripple[],
   shake: { mag: 0, until: 0 },
 
@@ -533,7 +522,6 @@ function startRun(practice: boolean): void {
   state.nextStruggleAt = 0;
   state.ending = null;
   state.particles = [];
-  state.bubbles = [];
   state.ripples = [];
   state.submitState = 'idle';
   state.submit = null;
@@ -1131,11 +1119,13 @@ function drawGame(now: number): void {
 
   drawHullSide(now);
   drawDeck(now);
-  drawDeckCaustics(now); // dancing light on the drowned planks (under entities)
-  drawRailing();
-  drawRefraction(now); // the submerged deck itself wobbles like liquid
-  drawEntitiesAndPlayer(now); // water strips are interleaved per row inside
-  drawFloodExtras(now); // front wall, meniscus, bubbles, glints, motes
+  drawDeckCaustics(now); // dancing light on the drowned planks
+  drawWaterSheet(now); // flat water IN the ship, clipped to the board
+  drawUnderwaterGrid(now); // playability as the wood drowns
+  drawRefraction(now); // the flooded floor wobbles like liquid
+  drawRailing(); // rails stay crisp ABOVE the water
+  drawEntitiesAndPlayer(now);
+  drawFloodExtras(now); // hull gauge, sparkles, ripples, glints, motes
   drawDepthFog(now); // distance-graded darkness — the world sinks toward black
   drawGodRays(now); // moonlight shafts cutting through the risen water
   drawCinematicVignette(now);
@@ -1315,11 +1305,10 @@ function drawRailing(): void {
 function drawEntitiesAndPlayer(now: number): void {
   const grid = state.grid!;
   const playerRow = state.playerR;
-  // Buoyancy: pearls, crates, sharks and the lifeboat FLOAT — they visibly
-  // ride UP with the surface as the deck fills (in the entity's local
-  // tile-units the surface height IS the water height). Watching loot lift
-  // off the deck is the strongest "the level is rising" cue on screen.
-  const lift = waterHeightTiles(now) * TILE;
+  // Buoyancy: pearls, crates, sharks and the lifeboat FLOAT — they lift off
+  // the deck as the water arrives, then bob on the surface. The lift is
+  // CAPPED so floaters sit in the water rather than hovering over the board.
+  const lift = Math.min(waterHeightTiles(now), 0.22) * TILE;
 
   const drawAt = (r: number, c: number, fn: () => void, dy = 0): void => {
     const { x, y } = rcToXY(r + 0.5, c + 0.5);
@@ -1333,19 +1322,14 @@ function drawEntitiesAndPlayer(now: number): void {
   };
 
   for (let r = 0; r < BOARD_SIZE; r++) {
-    // 1. Deck-bound things that get submerged: breaches and the survivor.
+    // Deck-bound things first: breaches and the survivor.
     for (let c = 0; c < BOARD_SIZE; c++) {
       if (grid[r][c] === 'breach') drawAt(r, c, () => drawBreach(now));
     }
     if (Math.round(playerRow) === r) drawPlayer(now);
 
-    // 2. This row's slice of the rising water — covers the deck-bound.
-    drawWaterRowStrip(r, now);
-    drawUnderwaterGridRow(r, now); // keeps tiles readable as the wood drowns
-
-    // 3. Buoyant things, ON TOP of the surface. Their contact shadows stay
-    //    ON THE DECK and fade as they rise — the widening gap between sprite
-    //    and shadow makes the climbing level readable on every single tile.
+    // Buoyant things bob gently on the risen water. Their contact shadows
+    // stay ON THE DECK and fade — the sprite-to-shadow gap reads as height.
     const liftFrac = Math.min(1, waterHeightTiles(now) / WATER_HEAD);
     const foamA = Math.min(1, (lift / TILE) / 0.2) * 0.5;
     const floatDraw = (fr: number, fc: number, shadowW: number, fn: () => void, liftMul = 1): void => {
@@ -1725,15 +1709,9 @@ function drawPlayer(now: number): void {
  * just before that row's water strip — see drawEntitiesAndPlayer).
  */
 
-/** Water depth in screen px above the deck at row coordinate rr. */
-function waterDepthPx(rr: number, now: number): number {
-  // Scale with the row's perspective size so far water looks far.
-  return waterHeightTiles(now) * tileWidthAt(rr);
-}
-
-/** Screen y of the water SURFACE at row coordinate rr (deck minus depth). */
-function waterSurfaceY(rr: number, now: number): number {
-  return BOARD_Y + BOARD_H * tAt(rr) - waterDepthPx(rr, now);
+/** Screen y of the deck plane at row coordinate rr. */
+function deckYAt(rr: number): number {
+  return BOARD_Y + BOARD_H * tAt(rr);
 }
 
 /** Left/right x of the water sheet (board edge + submerged rail) at rr. */
@@ -1788,7 +1766,7 @@ function waveAt(rr: number, now: number): number {
 
 /** The animated surface height at rr — deck plane lifted by level + wave. */
 function liveSurfaceY(rr: number, now: number): number {
-  return waterSurfaceY(rr, now) + waveAt(rr, now);
+  return deckYAt(rr) + waveAt(rr, now) * 0.6;
 }
 
 /** Linear mix of two RGB triples, as a CSS color with the given alpha. */
@@ -1807,35 +1785,41 @@ function mixRgba(
 const WATER_NEAR: readonly [number, number, number] = [40, 160, 205]; // lagoon
 const WATER_FAR: readonly [number, number, number] = [8, 52, 88]; // abyss
 
+/** Set the board trapezoid as the current path (for clips and fills). */
+function boardPath(): void {
+  const fL = rcToXY(0, 0);
+  const fR = rcToXY(0, BOARD_SIZE);
+  const nR = rcToXY(BOARD_SIZE, BOARD_SIZE);
+  const nL = rcToXY(BOARD_SIZE, 0);
+  ctx.beginPath();
+  ctx.moveTo(fL.x, fL.y);
+  ctx.lineTo(fR.x, fR.y);
+  ctx.lineTo(nR.x, nR.y);
+  ctx.lineTo(nL.x, nL.y);
+  ctx.closePath();
+}
+
 /**
- * One row's slice of the global water surface. Called from
- * drawEntitiesAndPlayer IMMEDIATELY after that row's occupants so occlusion
- * is correct: the water visibly climbs each character's body from the floor,
- * and nearer rows' strips overlap from the front. Color is distance-fogged
- * (near = lagoon teal, far = abyssal navy) and density grows with the level.
+ * The water IN the ship: a flat sheet lying on the deck, clipped strictly
+ * inside the board trapezoid — it never floats over rails or backdrop.
+ * Starts as a barely-there film, then WINS the floor: by the deep phase it is
+ * nearly opaque and the wood is gone (the glowing grid keeps play readable).
+ * Color is distance-fogged: lagoon teal near, abyssal navy far.
  */
-function drawWaterRowStrip(r: number, now: number): void {
+function drawWaterSheet(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
-
-  // Starts as a barely-there film, then the water WINS the floor: by the
-  // deep phase it is nearly opaque and the wood is gone — the glowing
-  // underwater grid (drawn right after each strip) keeps the board playable.
   const alpha = Math.min(0.86, 0.06 + 0.8 * Math.pow(Math.min(1, h / WATER_HEAD), 1.2));
-  const S = 4;
-  for (let i = 0; i < S; i++) {
-    const rr0 = r + i / S;
-    const rr1 = r + (i + 1) / S;
-    // Distance fog: farther slices read darker and colder.
-    ctx.fillStyle = mixRgba(WATER_NEAR, WATER_FAR, 1 - tAt((rr0 + rr1) / 2), alpha);
-    ctx.beginPath();
-    ctx.moveTo(waterXL(rr0), liveSurfaceY(rr0, now));
-    ctx.lineTo(waterXR(rr0), liveSurfaceY(rr0, now));
-    ctx.lineTo(waterXR(rr1), liveSurfaceY(rr1, now));
-    ctx.lineTo(waterXL(rr1), liveSurfaceY(rr1, now));
-    ctx.closePath();
-    ctx.fill();
+  ctx.save();
+  boardPath();
+  ctx.clip();
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    const y0 = deckYAt(r);
+    const y1 = deckYAt(r + 1);
+    ctx.fillStyle = mixRgba(WATER_NEAR, WATER_FAR, 1 - tAt(r + 0.5), alpha);
+    ctx.fillRect(0, y0 - 0.5, VIEW_W, y1 - y0 + 1);
   }
+  ctx.restore();
 }
 
 /**
@@ -1843,15 +1827,17 @@ function drawWaterRowStrip(r: number, now: number): void {
  * through from the drowned deck so the game stays perfectly playable — and it
  * doubles as a depth cue: grid fading in = wood going under.
  */
-function drawUnderwaterGridRow(r: number, now: number): void {
+function drawUnderwaterGrid(now: number): void {
   const h = waterHeightTiles(now);
   const a = Math.max(0, Math.min(1, (h - 0.28) / 0.55)) * 0.24;
   if (a <= 0.01) return;
   ctx.strokeStyle = `rgba(140, 220, 255, ${a.toFixed(3)})`;
   ctx.lineWidth = 1;
-  for (let c = 0; c < BOARD_SIZE; c++) {
-    tileQuadPath(r, c);
-    ctx.stroke();
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    for (let c = 0; c < BOARD_SIZE; c++) {
+      tileQuadPath(r, c);
+      ctx.stroke();
+    }
   }
 }
 
@@ -1944,98 +1930,70 @@ function drawDeckCaustics(now: number): void {
 }
 
 /**
- * After all rows: the water's FRONT FACE (the cross-section that visibly
- * grows), its glowing meniscus, rising bubble streams, specular glints, and
- * drifting motes. The set-dressing that makes the volume feel alive.
+ * Water set-dressing. The HULL GAUGE lives outside the board (the exterior
+ * waterline climbing the ship's side toward the deck edge — the level meter);
+ * every other effect is clipped INSIDE the board so nothing ever appears to
+ * float above the play area.
  */
 function drawFloodExtras(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
 
-  // --- Front face: the growing cross-section wall -------------------------
-  const xl = waterXL(BOARD_SIZE);
-  const xr = waterXR(BOARD_SIZE);
-  const ySurf = liveSurfaceY(BOARD_SIZE, now);
-  const yDeckNear = BOARD_Y + BOARD_H + RAIL;
-  const wall = ctx.createLinearGradient(0, ySurf, 0, yDeckNear);
-  wall.addColorStop(0, 'rgba(94, 205, 255, 0.95)');
-  wall.addColorStop(0.3, 'rgba(32, 138, 190, 0.92)');
-  wall.addColorStop(1, 'rgba(4, 40, 70, 0.96)');
-  ctx.fillStyle = wall;
-  ctx.fillRect(xl, ySurf, xr - xl, Math.max(0, yDeckNear - ySurf));
+  drawHullGauge(now, h);
 
-  // Light streaks shimmering inside the wall — the fish-tank cross-section.
-  if (yDeckNear - ySurf > 6) {
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(xl, ySurf, xr - xl, yDeckNear - ySurf);
-    ctx.clip();
-    ctx.globalCompositeOperation = 'lighter';
-    for (let i = 0; i < 9; i++) {
-      const sx = xl + ((i + 0.5) / 9) * (xr - xl) + Math.sin(now / 700 + i * 2.4) * TILE * 0.12;
-      const sw = TILE * (0.03 + 0.03 * hash01(i + 77));
-      const sa = 0.06 + 0.05 * Math.sin(now / 500 + i * 1.3);
-      if (sa <= 0.02) continue;
-      const sg = ctx.createLinearGradient(0, ySurf, 0, yDeckNear);
-      sg.addColorStop(0, `rgba(180, 235, 255, ${sa.toFixed(3)})`);
-      sg.addColorStop(1, 'rgba(180, 235, 255, 0)');
-      ctx.fillStyle = sg;
-      ctx.fillRect(sx - sw / 2, ySurf, sw, yDeckNear - ySurf);
-    }
-    ctx.restore();
-  }
-
-  // --- Meniscus: the glowing waterline you watch climb ---------------------
-  const meniscus = (y0: number, x0: number, x1: number, strength: number): void => {
-    ctx.save();
-    ctx.shadowColor = `rgba(159, 232, 255, ${(0.9 * strength).toFixed(3)})`;
-    ctx.shadowBlur = 10;
-    ctx.strokeStyle = `rgba(235, 251, 255, ${(0.95 * strength).toFixed(3)})`;
-    ctx.lineWidth = 2.5;
-    ctx.beginPath();
-    let first = true;
-    for (let x = x0; x <= x1; x += 8) {
-      const y =
-        y0 + Math.sin(x / 24 + now / 300) * TILE * 0.03 + Math.sin(x / 9 - now / 210) * TILE * 0.012;
-      if (first) {
-        ctx.moveTo(x, y);
-        first = false;
-      } else {
-        ctx.lineTo(x, y);
-      }
-    }
-    ctx.stroke();
-    // Refraction underline: a soft cyan echo just beneath the crest.
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = `rgba(127, 212, 255, ${(0.35 * strength).toFixed(3)})`;
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    first = true;
-    for (let x = x0; x <= x1; x += 8) {
-      const y =
-        y0 +
-        TILE * 0.045 +
-        Math.sin(x / 24 + now / 300) * TILE * 0.03 +
-        Math.sin(x / 9 - now / 210) * TILE * 0.012;
-      if (first) {
-        ctx.moveTo(x, y);
-        first = false;
-      } else {
-        ctx.lineTo(x, y);
-      }
-    }
-    ctx.stroke();
-    ctx.restore();
-  };
-  meniscus(ySurf, xl, xr, 1);
-  meniscus(liveSurfaceY(0, now), waterXL(0), waterXR(0), 0.45);
-
+  ctx.save();
+  boardPath();
+  ctx.clip();
   drawRailFoam(now, h);
   drawWaveSparkles(now, h);
   updateAndDrawRipples(now, h);
-  updateAndDrawBubbles(now, h);
   drawSurfaceGlints(now, h);
   drawMotes(now);
+  ctx.restore();
+}
+
+/**
+ * The hull gauge: the ocean visibly swallowing the ship's side. A bright
+ * waterline with a glowing crest climbs the hull band below the deck and
+ * reaches the deck edge exactly when the water tops your head.
+ */
+function drawHullGauge(now: number, h: number): void {
+  const xl = waterXL(BOARD_SIZE);
+  const xr = waterXR(BOARD_SIZE);
+  const bandTop = BOARD_Y + BOARD_H + RAIL; // just under the near rail
+  const bandBot = VIEW_H;
+  const frac = Math.min(1, h / WATER_HEAD);
+  // The sea starts partway up the hull and climbs to the deck edge.
+  const yLevel = bandBot - (bandBot - bandTop) * (0.35 + 0.65 * frac);
+
+  // The risen sea against the hull.
+  const sea = ctx.createLinearGradient(0, yLevel, 0, bandBot);
+  sea.addColorStop(0, 'rgba(94, 205, 255, 0.9)');
+  sea.addColorStop(0.35, 'rgba(28, 120, 170, 0.88)');
+  sea.addColorStop(1, 'rgba(4, 34, 60, 0.92)');
+  ctx.fillStyle = sea;
+  ctx.fillRect(xl, yLevel, xr - xl, Math.max(0, bandBot - yLevel));
+
+  // Glowing crest at the climbing waterline.
+  ctx.save();
+  ctx.shadowColor = 'rgba(159, 232, 255, 0.9)';
+  ctx.shadowBlur = 10;
+  ctx.strokeStyle = 'rgba(235, 251, 255, 0.95)';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  let first = true;
+  for (let x = xl; x <= xr; x += 8) {
+    const y =
+      yLevel + Math.sin(x / 24 + now / 300) * TILE * 0.035 + Math.sin(x / 9 - now / 210) * TILE * 0.014;
+    if (first) {
+      ctx.moveTo(x, y);
+      first = false;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+  ctx.restore();
 }
 
 /**
@@ -2136,44 +2094,6 @@ function hash01(n: number): number {
   return s - Math.floor(s);
 }
 
-/**
- * Bubble streams: seeded at random tiles, they rise from the drowned deck to
- * the surface with a sinusoidal wobble, growing and brightening, then vanish
- * at the meniscus. Constant quiet motion that makes the volume read as LIQUID.
- */
-function updateAndDrawBubbles(now: number, h: number): void {
-  if (state.phase === 'playing' && h > 0.08 && state.bubbles.length < 16 && Math.random() < 0.2) {
-    state.bubbles.push({
-      rr: Math.random() * BOARD_SIZE,
-      cc: Math.random() * BOARD_SIZE,
-      born: now,
-      dur: 1600 + Math.random() * 1400,
-      size: TILE * (0.02 + Math.random() * 0.03),
-      phase: Math.random() * Math.PI * 2,
-    });
-  }
-
-  ctx.save();
-  ctx.globalCompositeOperation = 'lighter';
-  state.bubbles = state.bubbles.filter((b) => now - b.born < b.dur);
-  for (const b of state.bubbles) {
-    const p = (now - b.born) / b.dur;
-    const deckY = BOARD_Y + BOARD_H * tAt(b.rr);
-    const surfY = liveSurfaceY(b.rr, now);
-    const y = deckY + (surfY - deckY) * p;
-    const x =
-      VIEW_W / 2 +
-      (b.cc - BOARD_SIZE / 2) * (widthAt(tAt(b.rr)) / BOARD_SIZE) +
-      Math.sin(now / 260 + b.phase) * TILE * 0.04;
-    ctx.strokeStyle = `rgba(220, 245, 255, ${(0.15 + 0.3 * p).toFixed(3)})`;
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    ctx.arc(x, y, b.size * (0.7 + 0.5 * p), 0, Math.PI * 2);
-    ctx.stroke();
-  }
-  ctx.restore();
-}
-
 /** Specular glints — sparks of moonlight skating on the surface plane. */
 function drawSurfaceGlints(now: number, h: number): void {
   const vis = Math.min(1, h / 0.3);
@@ -2204,9 +2124,8 @@ function drawMotes(now: number): void {
   for (let i = 0; i < 16; i++) {
     const rr = (hash01(i + 200) * BOARD_SIZE + now / 9000) % BOARD_SIZE;
     const cc = (hash01(i + 300) * BOARD_SIZE + Math.sin(now / 4000 + i) * 0.3 + BOARD_SIZE) % BOARD_SIZE;
-    const deckY = BOARD_Y + BOARD_H * tAt(rr);
-    const surfY = liveSurfaceY(rr, now);
-    const y = surfY + (deckY - surfY) * hash01(i + 400);
+    // Hovering just above the drowned floor, drifting with the current.
+    const y = deckYAt(rr) - hash01(i + 400) * TILE * 0.45 * g;
     const x = VIEW_W / 2 + (cc - BOARD_SIZE / 2) * (widthAt(tAt(rr)) / BOARD_SIZE);
     const a = 0.12 * g * (0.5 + 0.5 * Math.sin(now / 700 + i * 1.7));
     ctx.fillStyle = `rgba(190, 235, 255, ${a.toFixed(3)})`;
