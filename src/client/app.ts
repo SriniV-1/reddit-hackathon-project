@@ -143,6 +143,14 @@ const COLORS = {
 } as const;
 
 // ---------------------------------------------------------------------------
+// Pixel fonts — loaded via <link> in index.html from Google Fonts.
+//   • FONT_TITLE: chunky pixel font for headings, scores, buttons
+//   • FONT_BODY:  clean pixel font for stats, HUD, leaderboard, body text
+// ---------------------------------------------------------------------------
+const FONT_TITLE = "'Press Start 2P', monospace";
+const FONT_BODY = "'Silkscreen', monospace";
+
+// ---------------------------------------------------------------------------
 // Canvas + perspective layout ("2.75D").
 //
 // The deck is a trapezoid seen from a low three-quarter camera:
@@ -333,7 +341,7 @@ function noise(durMs: number, volume = 0.1, delayMs = 0, lowpassHz = 1200): void
 }
 
 function sfx(
-  name: 'move' | 'pearl' | 'crate' | 'hurt' | 'splash' | 'win' | 'lose' | 'ui'
+  name: 'move' | 'pearl' | 'crate' | 'hurt' | 'splash' | 'win' | 'lose' | 'ui' | 'rogueHit'
 ): void {
   if (!audio) return;
   switch (name) {
@@ -352,6 +360,12 @@ function sfx(
     case 'hurt':
       tone(140, 220, 'sawtooth', 0.14, 0, 55);
       noise(160, 0.08, 0, 900);
+      break;
+    case 'rogueHit':
+      // Deeper, more menacing version of hurt
+      tone(90, 300, 'sawtooth', 0.16, 0, 40);
+      tone(180, 180, 'square', 0.08, 50, 60);
+      noise(240, 0.12, 0, 600);
       break;
     case 'splash':
       noise(280, 0.12, 0, 700);
@@ -401,6 +415,103 @@ interface Ripple {
   dur: number;
 }
 
+// ---------------------------------------------------------------------------
+// Rogue shark — a free-roaming predator that swims continuously across the
+// board in real time, ignoring the tile grid. It loosely steers toward the
+// player, wobbles erratically, and bounces off the board edges. Getting
+// touched costs 1 HP with a brief invulnerability window.
+// ---------------------------------------------------------------------------
+interface RogueSharkState {
+  r: number;           // continuous board row (0..BOARD_SIZE)
+  c: number;           // continuous board col (0..BOARD_SIZE)
+  angle: number;       // heading in radians
+  speed: number;       // board-units per frame
+  wobbleSeed: number;  // phase offset for erratic motion
+  alive: boolean;      // whether the shark is active
+  hitCooldown: number; // timestamp: immune until this time (prevents multi-hit)
+  trail: Array<{ r: number; c: number; age: number }>; // wake trail positions
+}
+
+const ROGUE_SPEED = 0.028;        // board-units per frame (~1.7 tiles/sec at 60fps)
+const ROGUE_TURN_RATE = 0.06;     // max radians of steering per update
+const ROGUE_STEER_FRAMES = 30;    // re-aim every ~0.5s
+const ROGUE_WOBBLE_AMP = 0.3;     // how erratic the path looks
+const ROGUE_HIT_RADIUS = 0.55;    // board-units — roughly half a tile
+const ROGUE_HIT_COOLDOWN_MS = 1200; // invulnerability window after a hit
+const ROGUE_SPAWN_DELAY_S = 3;    // seconds into gameplay before the rogue appears
+const ROGUE_TRAIL_MAX = 14;       // number of wake dots
+
+let rogueFrame = 0; // frame counter for steering interval
+
+function createRogueShark(): RogueSharkState {
+  // Spawn far from the player (who starts at 0,0) — bottom-right area.
+  return {
+    r: BOARD_SIZE * 0.7 + Math.random() * BOARD_SIZE * 0.2,
+    c: BOARD_SIZE * 0.7 + Math.random() * BOARD_SIZE * 0.2,
+    angle: Math.random() * Math.PI * 2,
+    speed: ROGUE_SPEED,
+    wobbleSeed: Math.random() * 1000,
+    alive: false, // activates after ROGUE_SPAWN_DELAY_S
+    hitCooldown: 0,
+    trail: [],
+  };
+}
+
+function updateRogueShark(shark: RogueSharkState, now: number): void {
+  if (!shark.alive) {
+    // Activate after the spawn delay.
+    if (runElapsed(now) >= ROGUE_SPAWN_DELAY_S) {
+      shark.alive = true;
+    }
+    return;
+  }
+
+  rogueFrame++;
+
+  // Periodically steer toward the player (not every frame — gives a dodgeable arc).
+  if (rogueFrame % ROGUE_STEER_FRAMES === 0) {
+    const targetAngle = Math.atan2(
+      state.playerR - shark.r,
+      state.playerC - shark.c
+    );
+    let delta = targetAngle - shark.angle;
+    delta = Math.atan2(Math.sin(delta), Math.cos(delta)); // normalize to [-π, π]
+    shark.angle += Math.max(-ROGUE_TURN_RATE, Math.min(ROGUE_TURN_RATE, delta));
+  }
+
+  // Continuous wobble layered on the heading.
+  const wobble =
+    Math.sin((rogueFrame + shark.wobbleSeed) * 0.08) * ROGUE_WOBBLE_AMP * 0.12;
+  const heading = shark.angle + wobble;
+
+  // Move.
+  shark.c += Math.cos(heading) * shark.speed;
+  shark.r += Math.sin(heading) * shark.speed;
+
+  // Bounce off board edges.
+  const margin = 0.3;
+  if (shark.c < margin || shark.c > BOARD_SIZE - margin) {
+    shark.angle = Math.PI - shark.angle;
+    shark.c = Math.max(margin, Math.min(BOARD_SIZE - margin, shark.c));
+  }
+  if (shark.r < margin || shark.r > BOARD_SIZE - margin) {
+    shark.angle = -shark.angle;
+    shark.r = Math.max(margin, Math.min(BOARD_SIZE - margin, shark.r));
+  }
+
+  // Trail: record position, age out old entries.
+  shark.trail.unshift({ r: shark.r, c: shark.c, age: now });
+  if (shark.trail.length > ROGUE_TRAIL_MAX) shark.trail.pop();
+}
+
+function checkRogueSharkCollision(shark: RogueSharkState, now: number): boolean {
+  if (!shark.alive) return false;
+  if (now < shark.hitCooldown) return false;
+  const dr = shark.r - state.playerR;
+  const dc = shark.c - state.playerC;
+  return Math.sqrt(dr * dr + dc * dc) < ROGUE_HIT_RADIUS;
+}
+
 const state = {
   phase: 'loading' as Phase,
   error: '',
@@ -437,6 +548,9 @@ const state = {
   submitMsg: '',
 
   hitboxes: [] as Hitbox[],
+
+  // Rogue shark — the free-roaming predator.
+  rogueShark: null as RogueSharkState | null,
 };
 
 // ---------------------------------------------------------------------------
@@ -526,6 +640,8 @@ function startRun(practice: boolean): void {
   state.submitState = 'idle';
   state.submit = null;
   state.submitMsg = '';
+  state.rogueShark = null;
+  rogueFrame = 0;
   state.phase = 'relic';
 }
 
@@ -643,6 +759,7 @@ function chooseRelic(id: RelicId): void {
   state.relic = id;
   state.maxSteps = BASE_MAX_STEPS + (id === 'seaLegs' ? SEA_LEGS_BONUS : 0);
   state.runStart = performance.now(); // the flood starts NOW — run!
+  state.rogueShark = createRogueShark(); // summon the rogue
   state.phase = 'playing';
 }
 
@@ -686,6 +803,26 @@ function applyWaterPressure(now: number): void {
       state.shake = { mag: TILE * 0.15, until: now + 250 };
       if (state.hp <= 0) endRun('drowned');
     }
+  }
+}
+
+/**
+ * Update the rogue shark and check for collision with the player.
+ */
+function updateRogueSharkLogic(now: number): void {
+  const shark = state.rogueShark;
+  if (!shark || state.phase !== 'playing') return;
+
+  updateRogueShark(shark, now);
+
+  if (checkRogueSharkCollision(shark, now)) {
+    shark.hitCooldown = now + ROGUE_HIT_COOLDOWN_MS;
+    const { x, y } = rcToXY(state.playerR + 0.5, state.playerC + 0.5);
+    state.hp -= 1;
+    sfx('rogueHit');
+    burst(x, y, '#ff2244');
+    state.shake = { mag: TILE * 0.25, until: now + 350 };
+    if (state.hp <= 0) endRun('drowned');
   }
 }
 
@@ -831,6 +968,7 @@ function frame(now: number): void {
     case 'playing':
       updateMove(now);
       applyWaterPressure(now);
+      updateRogueSharkLogic(now);
       drawGame(now);
       break;
     case 'gameover':
@@ -861,7 +999,7 @@ function drawLoading(now: number): void {
   ctx.fillStyle = COLORS.hud;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = `600 ${Math.floor(VIEW_W * 0.05)}px sans-serif`;
+  ctx.font = `600 ${Math.floor(VIEW_W * 0.05)}px ${FONT_BODY}`;
   const dots = '.'.repeat(1 + (Math.floor(now / 400) % 3));
   ctx.fillText(`Boarding the ship${dots}`, VIEW_W / 2, VIEW_H / 2);
 }
@@ -893,19 +1031,20 @@ function drawTitle(now: number): void {
 
   const bob = Math.sin(now / 900) * VIEW_H * 0.004;
   ctx.fillStyle = COLORS.gold;
-  ctx.font = `800 ${Math.floor(VIEW_W * 0.115)}px sans-serif`;
-  ctx.fillText('LAST VOYAGE', VIEW_W / 2, VIEW_H * 0.55 + bob);
+  ctx.font = `700 ${Math.floor(VIEW_W * 0.058)}px ${FONT_TITLE}`;
+  ctx.fillText('LAST', VIEW_W / 2, VIEW_H * 0.53 + bob);
+  ctx.fillText('VOYAGE', VIEW_W / 2, VIEW_H * 0.575 + bob);
   ctx.fillStyle = COLORS.hud;
-  ctx.font = `500 ${Math.floor(VIEW_W * 0.036)}px sans-serif`;
+  ctx.font = `400 ${Math.floor(VIEW_W * 0.024)}px ${FONT_BODY}`;
   ctx.fillText(
     `The deck floods in ${Math.round(FLOOD_TOTAL_S)} seconds. Reach the lifeboat.`,
     VIEW_W / 2,
-    VIEW_H * 0.61 + bob
+    VIEW_H * 0.615 + bob
   );
 
   if (state.error) {
     ctx.fillStyle = COLORS.danger;
-    ctx.font = `500 ${Math.floor(VIEW_W * 0.028)}px sans-serif`;
+    ctx.font = `500 ${Math.floor(VIEW_W * 0.028)}px ${FONT_BODY}`;
     wrapText(state.error, VIEW_W / 2, VIEW_H * 0.655, VIEW_W * 0.9, VIEW_W * 0.04);
   }
 
@@ -917,7 +1056,7 @@ function drawTitle(now: number): void {
     if (init.personalBest > 0) chips.push(`⭐ best ${init.personalBest}`);
     chips.push(`⚓ r/${init.subreddit}`);
     ctx.fillStyle = COLORS.hudDim;
-    ctx.font = `600 ${Math.floor(VIEW_W * 0.032)}px sans-serif`;
+    ctx.font = `600 ${Math.floor(VIEW_W * 0.032)}px ${FONT_BODY}`;
     ctx.fillText(chips.join('    '), VIEW_W / 2, VIEW_H * 0.69);
   }
 
@@ -937,12 +1076,12 @@ function drawTitle(now: number): void {
   ctx.stroke();
 
   ctx.fillStyle = played ? COLORS.hud : '#2b1206';
-  ctx.font = `800 ${Math.floor(btnH * 0.42)}px sans-serif`;
-  ctx.fillText(played ? '⛵ PRACTICE RUN' : '🚢 SET SAIL', VIEW_W / 2, btnY + btnH / 2);
+  ctx.font = `700 ${Math.floor(btnH * 0.28)}px ${FONT_TITLE}`;
+  ctx.fillText(played ? 'PRACTICE RUN' : 'SET SAIL', VIEW_W / 2, btnY + btnH / 2);
   state.hitboxes.push({ id: 'play', x: btnX, y: btnY, w: btnW, h: btnH });
 
   ctx.fillStyle = COLORS.hudDim;
-  ctx.font = `500 ${Math.floor(VIEW_W * 0.03)}px sans-serif`;
+  ctx.font = `500 ${Math.floor(VIEW_W * 0.03)}px ${FONT_BODY}`;
   if (played && init) {
     ctx.fillText(
       `Today: ${init.todayScore ?? 0} pts  •  next ship in ${nextShipCountdown()}`,
@@ -962,7 +1101,7 @@ function drawTitle(now: number): void {
     const top = init.leaderboard.slice(0, 3);
     const line = top.map((row, i) => `${medals[i]} ${row.member} ${row.score}`).join('   ');
     ctx.fillStyle = COLORS.hudDim;
-    ctx.font = `600 ${Math.floor(VIEW_W * 0.028)}px sans-serif`;
+    ctx.font = `600 ${Math.floor(VIEW_W * 0.028)}px ${FONT_BODY}`;
     ctx.fillText(line, VIEW_W / 2, VIEW_H * 0.93);
   }
 }
@@ -1045,11 +1184,12 @@ function drawRelicSelect(now: number): void {
   ctx.textBaseline = 'middle';
 
   ctx.fillStyle = COLORS.gold;
-  ctx.font = `800 ${Math.floor(VIEW_W * 0.08)}px sans-serif`;
-  ctx.fillText('CHOOSE YOUR RELIC', VIEW_W / 2, VIEW_H * 0.13);
+  ctx.font = `700 ${Math.floor(VIEW_W * 0.038)}px ${FONT_TITLE}`;
+  ctx.fillText('CHOOSE YOUR', VIEW_W / 2, VIEW_H * 0.11);
+  ctx.fillText('RELIC', VIEW_W / 2, VIEW_H * 0.155);
 
   ctx.fillStyle = COLORS.hudDim;
-  ctx.font = `500 ${Math.floor(VIEW_W * 0.034)}px sans-serif`;
+  ctx.font = `500 ${Math.floor(VIEW_W * 0.034)}px ${FONT_BODY}`;
   ctx.fillText(
     state.practice ? 'Practice run — experiment freely!' : 'One relic. One voyage. Choose well.',
     VIEW_W / 2,
@@ -1073,14 +1213,14 @@ function drawRelicSelect(now: number): void {
     ctx.stroke();
 
     ctx.textAlign = 'left';
-    ctx.font = `${Math.floor(cardH * 0.48)}px sans-serif`;
+    ctx.font = `${Math.floor(cardH * 0.48)}px ${FONT_BODY}`;
     ctx.fillText(relic.emoji, cardX + cardW * 0.05, cardY + cardH * 0.52);
 
     ctx.fillStyle = COLORS.gold;
-    ctx.font = `700 ${Math.floor(cardH * 0.28)}px sans-serif`;
+    ctx.font = `700 ${Math.floor(cardH * 0.18)}px ${FONT_TITLE}`;
     ctx.fillText(relic.name, cardX + cardW * 0.2, cardY + cardH * 0.36);
     ctx.fillStyle = COLORS.hud;
-    ctx.font = `500 ${Math.floor(cardH * 0.22)}px sans-serif`;
+    ctx.font = `400 ${Math.floor(cardH * 0.2)}px ${FONT_BODY}`;
     ctx.fillText(relic.blurb, cardX + cardW * 0.2, cardY + cardH * 0.68);
     ctx.textAlign = 'center';
 
@@ -1089,10 +1229,10 @@ function drawRelicSelect(now: number): void {
   }
 
   ctx.fillStyle = COLORS.hudDim;
-  ctx.font = `500 ${Math.floor(VIEW_W * 0.028)}px sans-serif`;
+  ctx.font = `500 ${Math.floor(VIEW_W * 0.028)}px ${FONT_BODY}`;
   ctx.fillText('🦪 pearl +10   📦 crate +50   🦈 / 🌀 −1 HP   🚣 escape +100', VIEW_W / 2, cardY + VIEW_H * 0.015);
   ctx.fillStyle = COLORS.breachFoam;
-  ctx.font = `700 ${Math.floor(VIEW_W * 0.032)}px sans-serif`;
+  ctx.font = `700 ${Math.floor(VIEW_W * 0.032)}px ${FONT_BODY}`;
   ctx.fillText(
     `⚠️ The water starts rising the moment you choose — over your head in ${Math.round(FLOOD_TOTAL_S)}s. RUN!`,
     VIEW_W / 2,
@@ -1125,6 +1265,7 @@ function drawGame(now: number): void {
   drawRefraction(now); // the flooded floor wobbles like liquid
   drawRailing(); // rails stay crisp ABOVE the water
   drawEntitiesAndPlayer(now);
+  drawRogueSharkEntity(now); // THE ROGUE — drawn on top of everything on the board
   drawFloodExtras(now); // hull gauge, sparkles, ripples, glints, motes
   drawDepthFog(now); // distance-graded darkness — the world sinks toward black
   drawGodRays(now); // moonlight shafts cutting through the risen water
@@ -1147,7 +1288,7 @@ function drawGame(now: number): void {
     roundRect(rx, ry, rw, rh, rh / 2);
     ctx.fill();
     ctx.fillStyle = '#2b1206';
-    ctx.font = `800 ${Math.floor(rh * 0.55)}px sans-serif`;
+    ctx.font = `700 ${Math.floor(rh * 0.36)}px ${FONT_TITLE}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText('PRACTICE', rx + rw / 2, ry + rh / 2 + 0.5);
@@ -1374,6 +1515,104 @@ function drawEntitiesAndPlayer(now: number): void {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Rogue shark renderer — crimson predator with a glowing trail.
+// ---------------------------------------------------------------------------
+function drawRogueSharkEntity(now: number): void {
+  const shark = state.rogueShark;
+  if (!shark || !shark.alive) return;
+
+  const { x, y } = rcToXY(shark.r, shark.c);
+  const k = tileWidthAt(shark.r) / TILE;
+
+  // ---------- WAKE TRAIL — fading crimson dots behind the shark ----------
+  ctx.save();
+  for (let i = 1; i < shark.trail.length; i++) {
+    const t = shark.trail[i];
+    const age = (now - t.age) / 600; // 0..1 over ~600ms
+    if (age > 1) continue;
+    const tp = rcToXY(t.r, t.c);
+    const tk = tileWidthAt(t.r) / TILE;
+    const alpha = (1 - age) * 0.45;
+    const rad = TILE * 0.08 * tk * (1 - age * 0.5);
+    ctx.fillStyle = `rgba(255, 34, 68, ${alpha.toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(tp.x, tp.y, rad, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // ---------- DANGER GLOW — pulsing crimson halo ----------
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(k, k);
+  const pulse = 0.5 + 0.5 * Math.sin(now / 200);
+  const glowR = TILE * 0.7;
+  const glow = ctx.createRadialGradient(0, 0, TILE * 0.1, 0, 0, glowR);
+  glow.addColorStop(0, `rgba(255, 34, 68, ${(0.35 + pulse * 0.2).toFixed(3)})`);
+  glow.addColorStop(0.5, `rgba(200, 20, 50, ${(0.15 + pulse * 0.1).toFixed(3)})`);
+  glow.addColorStop(1, 'rgba(200, 20, 50, 0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(-glowR, -glowR, glowR * 2, glowR * 2);
+
+  // ---------- BODY — larger, darker, meaner than the tile sharks ----------
+  const sway = Math.sin(now / 180) * TILE * 0.04;
+  const bodyR = TILE * 0.34;
+  ctx.save();
+  ctx.translate(sway, 0);
+  ctx.rotate(shark.angle + Math.PI / 2); // point the shark in its heading direction
+
+  // Main body — dark crimson
+  ctx.fillStyle = '#8b1a2b';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, bodyR * 0.85, bodyR * 1.2, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Belly — pale pink
+  ctx.fillStyle = '#d4a0a8';
+  ctx.beginPath();
+  ctx.ellipse(bodyR * 0.15, 0, bodyR * 0.45, bodyR * 0.85, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Dorsal fin — tall and menacing
+  ctx.fillStyle = '#6b0f1e';
+  ctx.beginPath();
+  ctx.moveTo(-bodyR * 0.08, -bodyR * 0.9);
+  ctx.lineTo(bodyR * 0.35, -bodyR * 1.7);
+  ctx.lineTo(bodyR * 0.55, -bodyR * 0.75);
+  ctx.closePath();
+  ctx.fill();
+
+  // Tail
+  ctx.beginPath();
+  ctx.moveTo(0, bodyR * 1.1);
+  ctx.lineTo(-bodyR * 0.55, bodyR * 1.7);
+  ctx.lineTo(bodyR * 0.55, bodyR * 1.7);
+  ctx.closePath();
+  ctx.fill();
+
+  // Eye — glowing red
+  ctx.fillStyle = '#ff4466';
+  ctx.beginPath();
+  ctx.arc(-bodyR * 0.35, -bodyR * 0.2, bodyR * 0.14, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#110000';
+  ctx.beginPath();
+  ctx.arc(-bodyR * 0.35, -bodyR * 0.2, bodyR * 0.07, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Scar / teeth line
+  ctx.strokeStyle = '#ff8899';
+  ctx.lineWidth = Math.max(1.5, TILE * 0.03);
+  ctx.beginPath();
+  ctx.moveTo(-bodyR * 0.7, bodyR * 0.1);
+  ctx.lineTo(-bodyR * 0.15, bodyR * 0.2);
+  ctx.stroke();
+
+  ctx.restore(); // un-rotate
+  ctx.restore(); // un-scale/translate
 }
 
 /** Elliptical contact shadow (origin-relative, TILE units). */
@@ -1643,10 +1882,6 @@ function drawPlayer(now: number): void {
   ctx.restore();
 
   // --- Submersion overlay: THE "water is rising" shot -----------------------
-  // Water drawn ON the survivor, from the feet up to the current waterline,
-  // with a foam ring lapping around the body. As the global level climbs you
-  // watch this line travel up their legs, chest, and finally over their head.
-  // (Drawn in the un-hopped frame so the waterline stays put while they jump.)
   const h = waterHeightTiles(now); // tile-units
   if (h > 0.03) {
     ctx.save();
@@ -1654,8 +1889,6 @@ function drawPlayer(now: number): void {
     ctx.scale(k, k);
     const yDeckLocal = TILE * 0.3; // the deck plane at the feet
     const yLine = yDeckLocal - h * TILE; // local waterline height
-    // Soft water tint over the submerged part of the body — a radial blob
-    // that fades at the edges (no hard box), just enough to sink the sprite.
     const midY = (yLine + yDeckLocal) / 2;
     const half = (yDeckLocal - yLine) / 2 + TILE * 0.08;
     ctx.save();
@@ -1678,8 +1911,6 @@ function drawPlayer(now: number): void {
     ctx.ellipse(0, yLine + lap, TILE * 0.34, TILE * 0.09, 0, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Exhaled air once they're going under — a thin trail of bubbles racing
-    // for the surface.
     if (h > 0.55) {
       ctx.fillStyle = 'rgba(220, 245, 255, 0.55)';
       for (let i = 0; i < 3; i++) {
@@ -1700,13 +1931,7 @@ function drawPlayer(now: number): void {
 
 /**
  * The flood — ONE horizontal water surface across the whole deck, rising
- * VERTICALLY from the floor like a room filling up. Every tile shares the
- * same water height h; each row's slice of the surface is that row's deck
- * plane LIFTED by h (scaled to the row's perspective size so the plane
- * recedes toward the vanishing point). Characters sink from the feet up:
- * whatever stands taller than h pokes out crisp above the surface, the rest
- * shows tinted through the translucent fill (each row's occupants are painted
- * just before that row's water strip — see drawEntitiesAndPlayer).
+ * VERTICALLY from the floor like a room filling up.
  */
 
 /** Screen y of the deck plane at row coordinate rr. */
@@ -1728,12 +1953,6 @@ function depthGlow(now: number): number {
   return Math.max(0, Math.min(1, (h - WATER_CHEST) / (WATER_HEAD - WATER_CHEST)));
 }
 
-/**
- * Bioluminescent halo behind an entity once the deck is deep underwater.
- * The world darkens as it sinks, so everything that matters starts to GLOW —
- * the last seconds stay readable and look properly abyssal. Drawn in the
- * entity's local frame, centered on the origin.
- */
 function glowHalo(now: number, rgb: string, radius: number, strength = 0.5): void {
   const g = depthGlow(now);
   if (g <= 0.02) return;
@@ -1747,13 +1966,9 @@ function glowHalo(now: number, rgb: string, radius: number, strength = 0.5): voi
 }
 
 // ===========================================================================
-//  WATER FX SUITE — cinematic three-act sink
-//  Act I  (0–35%):  a glassy teal film, glints skating across the surface
-//  Act II (35–65%): heavy ocean volume, caustics dancing on the drowned deck
-//  Act III (65%+):  black abyss cut by god-rays, lit by bioluminescence
+//  WATER FX SUITE
 // ===========================================================================
 
-/** Three-octave surface wave: slow swell + medium chop + fast ripple. */
 function waveAt(rr: number, now: number): number {
   return (
     (Math.sin(now / 1400 + rr * 0.9) * 0.62 +
@@ -1764,12 +1979,10 @@ function waveAt(rr: number, now: number): number {
   );
 }
 
-/** The animated surface height at rr — deck plane lifted by level + wave. */
 function liveSurfaceY(rr: number, now: number): number {
   return deckYAt(rr) + waveAt(rr, now) * 0.6;
 }
 
-/** Linear mix of two RGB triples, as a CSS color with the given alpha. */
 function mixRgba(
   a: readonly [number, number, number],
   b: readonly [number, number, number],
@@ -1782,10 +1995,9 @@ function mixRgba(
   return `rgba(${r}, ${g}, ${bl}, ${alpha.toFixed(3)})`;
 }
 
-const WATER_NEAR: readonly [number, number, number] = [40, 160, 205]; // lagoon
-const WATER_FAR: readonly [number, number, number] = [8, 52, 88]; // abyss
+const WATER_NEAR: readonly [number, number, number] = [40, 160, 205];
+const WATER_FAR: readonly [number, number, number] = [8, 52, 88];
 
-/** Set the board trapezoid as the current path (for clips and fills). */
 function boardPath(): void {
   const fL = rcToXY(0, 0);
   const fR = rcToXY(0, BOARD_SIZE);
@@ -1799,13 +2011,6 @@ function boardPath(): void {
   ctx.closePath();
 }
 
-/**
- * The water IN the ship: a flat sheet lying on the deck, clipped strictly
- * inside the board trapezoid — it never floats over rails or backdrop.
- * Starts as a barely-there film, then WINS the floor: by the deep phase it is
- * nearly opaque and the wood is gone (the glowing grid keeps play readable).
- * Color is distance-fogged: lagoon teal near, abyssal navy far.
- */
 function drawWaterSheet(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
@@ -1822,11 +2027,6 @@ function drawWaterSheet(now: number): void {
   ctx.restore();
 }
 
-/**
- * As the water turns opaque and the wood disappears, a faint cyan grid glows
- * through from the drowned deck so the game stays perfectly playable — and it
- * doubles as a depth cue: grid fading in = wood going under.
- */
 function drawUnderwaterGrid(now: number): void {
   const h = waterHeightTiles(now);
   const a = Math.max(0, Math.min(1, (h - 0.28) / 0.55)) * 0.24;
@@ -1841,12 +2041,6 @@ function drawUnderwaterGrid(now: number): void {
   }
 }
 
-/**
- * Screen-space refraction: re-blit the just-drawn deck in thin horizontal
- * slices, each displaced sideways by interfering sine waves whose amplitude
- * grows with the water level. The BOARD ITSELF visibly wavers like it's under
- * moving water — the single strongest "this whole surface is submerged" cue.
- */
 function drawRefraction(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0.04) return;
@@ -1855,7 +2049,7 @@ function drawRefraction(now: number): void {
   const bottom = BOARD_Y + BOARD_H;
   const slices = 30;
   const sliceH = (bottom - top) / slices;
-  const strength = Math.min(1, h / 0.5); // ramps in over the first half
+  const strength = Math.min(1, h / 0.5);
   for (let i = 0; i < slices; i++) {
     const sy = top + i * sliceH;
     const off =
@@ -1877,11 +2071,6 @@ function drawRefraction(now: number): void {
   }
 }
 
-/**
- * Caustic light dancing on the submerged deck — two interfering wave lattices
- * drawn UNDER the entities, clipped to the board trapezoid. The classic
- * "swimming-pool floor" shimmer that instantly reads as water over wood.
- */
 function drawDeckCaustics(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0.02) return;
@@ -1929,12 +2118,6 @@ function drawDeckCaustics(now: number): void {
   ctx.restore();
 }
 
-/**
- * Water set-dressing. The HULL GAUGE lives outside the board (the exterior
- * waterline climbing the ship's side toward the deck edge — the level meter);
- * every other effect is clipped INSIDE the board so nothing ever appears to
- * float above the play area.
- */
 function drawFloodExtras(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
@@ -1952,21 +2135,14 @@ function drawFloodExtras(now: number): void {
   ctx.restore();
 }
 
-/**
- * The hull gauge: the ocean visibly swallowing the ship's side. A bright
- * waterline with a glowing crest climbs the hull band below the deck and
- * reaches the deck edge exactly when the water tops your head.
- */
 function drawHullGauge(now: number, h: number): void {
   const xl = waterXL(BOARD_SIZE);
   const xr = waterXR(BOARD_SIZE);
-  const bandTop = BOARD_Y + BOARD_H + RAIL; // just under the near rail
+  const bandTop = BOARD_Y + BOARD_H + RAIL;
   const bandBot = VIEW_H;
   const frac = Math.min(1, h / WATER_HEAD);
-  // The sea starts partway up the hull and climbs to the deck edge.
   const yLevel = bandBot - (bandBot - bandTop) * (0.35 + 0.65 * frac);
 
-  // The risen sea against the hull.
   const sea = ctx.createLinearGradient(0, yLevel, 0, bandBot);
   sea.addColorStop(0, 'rgba(94, 205, 255, 0.9)');
   sea.addColorStop(0.35, 'rgba(28, 120, 170, 0.88)');
@@ -1974,7 +2150,6 @@ function drawHullGauge(now: number, h: number): void {
   ctx.fillStyle = sea;
   ctx.fillRect(xl, yLevel, xr - xl, Math.max(0, bandBot - yLevel));
 
-  // Glowing crest at the climbing waterline.
   ctx.save();
   ctx.shadowColor = 'rgba(159, 232, 255, 0.9)';
   ctx.shadowBlur = 10;
@@ -1996,11 +2171,6 @@ function drawHullGauge(now: number, h: number): void {
   ctx.restore();
 }
 
-/**
- * The classic cartoon-water read: chunky drifting wave glints (small arcs)
- * scattered across the ENTIRE surface. This is what makes the floor itself
- * scream "water" at a glance — density and brightness climb with the level.
- */
 function drawWaveSparkles(now: number, h: number): void {
   const vis = Math.min(1, h / 0.25) * (0.55 + 0.45 * Math.min(1, h / WATER_HEAD));
   if (vis <= 0.03) return;
@@ -2018,15 +2188,11 @@ function drawWaveSparkles(now: number, h: number): void {
     ctx.strokeStyle = `rgba(215, 245, 255, ${a.toFixed(3)})`;
     ctx.lineWidth = Math.max(1.3, tw * 0.05);
     ctx.beginPath();
-    ctx.arc(x, y, w, Math.PI * 0.12, Math.PI * 0.88); // the little "wave smile"
+    ctx.arc(x, y, w, Math.PI * 0.12, Math.PI * 0.88);
     ctx.stroke();
   }
 }
 
-/**
- * Foam where the water meets the ship's sides — the surface boundary is
- * outlined in white all the way around the board, not just at the front.
- */
 function drawRailFoam(now: number, h: number): void {
   const a = Math.min(1, h / 0.18) * 0.42;
   if (a <= 0.03) return;
@@ -2051,11 +2217,6 @@ function drawRailFoam(now: number, h: number): void {
   }
 }
 
-/**
- * Ripple rings blooming at random spots across the WHOLE surface — perspective
- * -squashed expanding ellipses that fade as they grow. Liquid activity on the
- * board itself, not just at its edges.
- */
 function updateAndDrawRipples(now: number, h: number): void {
   if (state.phase === 'playing' && h > 0.05 && state.ripples.length < 8 && Math.random() < 0.12) {
     state.ripples.push({
@@ -2078,7 +2239,6 @@ function updateAndDrawRipples(now: number, h: number): void {
     ctx.beginPath();
     ctx.ellipse(x, y, rx, rx * 0.35, 0, 0, Math.PI * 2);
     ctx.stroke();
-    // Inner echo ring for the fresh ripples.
     if (p < 0.55) {
       ctx.strokeStyle = `rgba(220, 245, 255, ${((0.55 - p) * 0.35).toFixed(3)})`;
       ctx.beginPath();
@@ -2088,13 +2248,11 @@ function updateAndDrawRipples(now: number, h: number): void {
   }
 }
 
-/** Deterministic 0..1 hash for stable pseudo-random FX placement. */
 function hash01(n: number): number {
   const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
   return s - Math.floor(s);
 }
 
-/** Specular glints — sparks of moonlight skating on the surface plane. */
 function drawSurfaceGlints(now: number, h: number): void {
   const vis = Math.min(1, h / 0.3);
   ctx.save();
@@ -2115,7 +2273,6 @@ function drawSurfaceGlints(now: number, h: number): void {
   ctx.restore();
 }
 
-/** Drifting motes in the deep-water light — plankton in the beams. */
 function drawMotes(now: number): void {
   const g = depthGlow(now);
   if (g <= 0.05) return;
@@ -2124,7 +2281,6 @@ function drawMotes(now: number): void {
   for (let i = 0; i < 16; i++) {
     const rr = (hash01(i + 200) * BOARD_SIZE + now / 9000) % BOARD_SIZE;
     const cc = (hash01(i + 300) * BOARD_SIZE + Math.sin(now / 4000 + i) * 0.3 + BOARD_SIZE) % BOARD_SIZE;
-    // Hovering just above the drowned floor, drifting with the current.
     const y = deckYAt(rr) - hash01(i + 400) * TILE * 0.45 * g;
     const x = VIEW_W / 2 + (cc - BOARD_SIZE / 2) * (widthAt(tAt(rr)) / BOARD_SIZE);
     const a = 0.12 * g * (0.5 + 0.5 * Math.sin(now / 700 + i * 1.7));
@@ -2136,10 +2292,6 @@ function drawMotes(now: number): void {
   ctx.restore();
 }
 
-/**
- * Depth fog — distance-graded, not flat: the far (stern) end of the drowned
- * deck vanishes first, exactly like looking down a flooding corridor.
- */
 function drawDepthFog(now: number): void {
   const h = waterHeightTiles(now);
   if (h <= 0) return;
@@ -2152,10 +2304,6 @@ function drawDepthFog(now: number): void {
   ctx.fillRect(0, HUD_H, VIEW_W, VIEW_H - HUD_H);
 }
 
-/**
- * God-rays: shafts of moonlight refracting down through the risen water,
- * swaying slowly. Screen-composited so they cut through the depth fog.
- */
 function drawGodRays(now: number): void {
   const h = waterHeightTiles(now);
   const f = Math.max(0, Math.min(1, (h - 0.25) / (WATER_HEAD - 0.25)));
@@ -2186,10 +2334,6 @@ function drawGodRays(now: number): void {
   ctx.restore();
 }
 
-/**
- * Cinematic vignette — always on for depth-of-frame, deepening as the water
- * rises, with the red danger pulse folded in once the survivor is struggling.
- */
 function drawCinematicVignette(now: number): void {
   const h = waterHeightTiles(now);
   const base = 0.2 + 0.32 * Math.pow(Math.min(1, h / WATER_HEAD), 1.2);
@@ -2238,7 +2382,7 @@ function drawHud(now: number): void {
   ctx.textBaseline = 'middle';
 
   ctx.textAlign = 'left';
-  ctx.font = `${Math.floor(HUD_H * 0.32)}px sans-serif`;
+  ctx.font = `${Math.floor(HUD_H * 0.32)}px ${FONT_BODY}`;
   let hearts = '';
   for (let i = 0; i < START_HP; i++) hearts += i < state.hp ? '❤️' : '🖤';
   ctx.fillText(hearts, pad, HUD_H * 0.3);
@@ -2246,20 +2390,20 @@ function drawHud(now: number): void {
   const relic = RELICS.find((r) => r.id === state.relic);
   if (relic) {
     ctx.fillStyle = COLORS.hudDim;
-    ctx.font = `500 ${Math.floor(HUD_H * 0.19)}px sans-serif`;
+    ctx.font = `500 ${Math.floor(HUD_H * 0.19)}px ${FONT_BODY}`;
     ctx.fillText(`${relic.emoji} ${relic.name}`, pad, HUD_H * 0.72);
   }
 
   ctx.textAlign = 'right';
   ctx.fillStyle = COLORS.gold;
-  ctx.font = `800 ${Math.floor(HUD_H * 0.34)}px sans-serif`;
+  ctx.font = `700 ${Math.floor(HUD_H * 0.22)}px ${FONT_TITLE}`;
   ctx.fillText(`${state.score}`, VIEW_W - pad, HUD_H * 0.3);
 
   const left = Math.max(0, state.maxSteps - state.stepsUsed);
   const low = left <= 4;
   const flash = low && Math.floor(now / 400) % 2 === 0;
   ctx.fillStyle = flash ? COLORS.danger : low ? '#ffb1b1' : COLORS.hudDim;
-  ctx.font = `600 ${Math.floor(HUD_H * 0.2)}px sans-serif`;
+  ctx.font = `600 ${Math.floor(HUD_H * 0.2)}px ${FONT_BODY}`;
   ctx.fillText(`${left} ${left === 1 ? 'move' : 'moves'} left`, VIEW_W - pad, HUD_H * 0.72);
 
   // Flood ticker + water gauge, centered.
@@ -2270,15 +2414,13 @@ function drawHud(now: number): void {
     const struggling = h >= WATER_CHEST;
     const urgent = struggling && Math.floor(now / 220) % 2 === 0;
     ctx.fillStyle = urgent ? COLORS.danger : COLORS.breachFoam;
-    ctx.font = `700 ${Math.floor(HUD_H * 0.19)}px sans-serif`;
+    ctx.font = `700 ${Math.floor(HUD_H * 0.19)}px ${FONT_BODY}`;
     ctx.fillText(
       struggling ? `🌊 DROWNING in ${tLeft.toFixed(1)}s` : `🌊 overhead in ${Math.ceil(tLeft)}s`,
       VIEW_W / 2,
       HUD_H * 0.36
     );
 
-    // Water gauge: a slim graded bar filling toward the drown mark, with a
-    // notch at chest depth (where the struggling starts).
     const gw = VIEW_W * 0.26;
     const gh = Math.max(4, HUD_H * 0.09);
     const gx = VIEW_W / 2 - gw / 2;
@@ -2296,13 +2438,41 @@ function drawHud(now: number): void {
       roundRect(gx, gy, Math.max(gh, gw * frac), gh, gh / 2);
       ctx.fill();
     }
-    // Chest-depth notch.
     ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
     ctx.fillRect(gx + gw * (WATER_CHEST / WATER_HEAD) - 1, gy - 1.5, 2, gh + 3);
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
     ctx.lineWidth = 1;
     roundRect(gx, gy, gw, gh, gh / 2);
     ctx.stroke();
+
+    // Rogue shark warning indicator
+    const shark = state.rogueShark;
+    if (shark && shark.alive) {
+      const dr = shark.r - state.playerR;
+      const dc = shark.c - state.playerC;
+      const dist = Math.sqrt(dr * dr + dc * dc);
+      const dangerPulse = dist < 2.5 ? (0.6 + 0.4 * Math.sin(now / 120)) : 0.7;
+      ctx.fillStyle = dist < 2.5
+        ? `rgba(255, 34, 68, ${dangerPulse.toFixed(2)})`
+        : 'rgba(255, 100, 120, 0.7)';
+      ctx.font = `700 ${Math.floor(HUD_H * 0.16)}px ${FONT_BODY}`;
+      ctx.fillText(
+        dist < 2.5 ? '🦈 ROGUE SHARK NEARBY!' : '🦈 Rogue shark prowling...',
+        VIEW_W / 2,
+        HUD_H * 0.82
+      );
+    } else if (shark && !shark.alive) {
+      const remaining = Math.max(0, ROGUE_SPAWN_DELAY_S - runElapsed(now));
+      if (remaining > 0 && remaining < ROGUE_SPAWN_DELAY_S) {
+        ctx.fillStyle = 'rgba(255, 150, 160, 0.5)';
+        ctx.font = `600 ${Math.floor(HUD_H * 0.14)}px ${FONT_BODY}`;
+        ctx.fillText(
+          `🦈 Rogue shark in ${remaining.toFixed(0)}s...`,
+          VIEW_W / 2,
+          HUD_H * 0.82
+        );
+      }
+    }
   }
 }
 
@@ -2324,28 +2494,28 @@ function drawGameOver(now: number): void {
   const info = state.ending ? titleMap[state.ending] : { text: 'GAME OVER', color: COLORS.hud };
 
   ctx.fillStyle = info.color;
-  ctx.font = `800 ${Math.floor(VIEW_W * 0.08)}px sans-serif`;
+  ctx.font = `700 ${Math.floor(VIEW_W * 0.04)}px ${FONT_TITLE}`;
   ctx.fillText(info.text, VIEW_W / 2, VIEW_H * 0.12);
 
   ctx.fillStyle = COLORS.gold;
-  ctx.font = `800 ${Math.floor(VIEW_W * 0.14)}px sans-serif`;
+  ctx.font = `700 ${Math.floor(VIEW_W * 0.075)}px ${FONT_TITLE}`;
   ctx.fillText(`${state.score}`, VIEW_W / 2, VIEW_H * 0.22);
 
   const sub = state.submit;
   if (sub?.isNewBest) {
     const pulse = 0.6 + 0.4 * Math.sin(now / 250);
     ctx.fillStyle = `rgba(255, 210, 63, ${pulse})`;
-    ctx.font = `800 ${Math.floor(VIEW_W * 0.04)}px sans-serif`;
+    ctx.font = `700 ${Math.floor(VIEW_W * 0.02)}px ${FONT_TITLE}`;
     ctx.fillText('★ NEW PERSONAL BEST ★', VIEW_W / 2, VIEW_H * 0.29);
   } else {
     ctx.fillStyle = COLORS.hudDim;
-    ctx.font = `500 ${Math.floor(VIEW_W * 0.032)}px sans-serif`;
+    ctx.font = `500 ${Math.floor(VIEW_W * 0.032)}px ${FONT_BODY}`;
     ctx.fillText('pearls & plunder', VIEW_W / 2, VIEW_H * 0.29);
   }
 
   if (sub) {
     ctx.fillStyle = COLORS.hud;
-    ctx.font = `600 ${Math.floor(VIEW_W * 0.036)}px sans-serif`;
+    ctx.font = `600 ${Math.floor(VIEW_W * 0.036)}px ${FONT_BODY}`;
     ctx.fillText(
       `🔥 ${sub.streak}-day streak    ⚓ r/${sub.faction}: ${Math.floor(sub.factionTotal)}`,
       VIEW_W / 2,
@@ -2353,11 +2523,11 @@ function drawGameOver(now: number): void {
     );
   } else if (state.submitMsg) {
     ctx.fillStyle = state.submitState === 'error' ? COLORS.danger : COLORS.hudDim;
-    ctx.font = `500 ${Math.floor(VIEW_W * 0.03)}px sans-serif`;
+    ctx.font = `500 ${Math.floor(VIEW_W * 0.03)}px ${FONT_BODY}`;
     wrapText(state.submitMsg, VIEW_W / 2, VIEW_H * 0.36, VIEW_W * 0.86, VIEW_W * 0.042);
   } else if (state.submitState === 'sending') {
     ctx.fillStyle = COLORS.hudDim;
-    ctx.font = `500 ${Math.floor(VIEW_W * 0.03)}px sans-serif`;
+    ctx.font = `500 ${Math.floor(VIEW_W * 0.03)}px ${FONT_BODY}`;
     ctx.fillText(
       `Logging your voyage${'.'.repeat(1 + (Math.floor(now / 400) % 3))}`,
       VIEW_W / 2,
@@ -2368,8 +2538,8 @@ function drawGameOver(now: number): void {
   const rows = sub?.leaderboard ?? state.init?.leaderboard ?? [];
   if (rows.length > 0) {
     ctx.fillStyle = COLORS.gold;
-    ctx.font = `700 ${Math.floor(VIEW_W * 0.038)}px sans-serif`;
-    ctx.fillText("— TODAY'S SURVIVORS —", VIEW_W / 2, VIEW_H * 0.44);
+    ctx.font = `700 ${Math.floor(VIEW_W * 0.02)}px ${FONT_TITLE}`;
+    ctx.fillText("TODAY'S SURVIVORS", VIEW_W / 2, VIEW_H * 0.44);
 
     const rowH = VIEW_H * 0.045;
     const top = rows.slice(0, 5);
@@ -2379,7 +2549,7 @@ function drawGameOver(now: number): void {
       const row = top[i];
       const isYou = row.member === you;
       ctx.fillStyle = isYou ? COLORS.gold : COLORS.hud;
-      ctx.font = `${isYou ? 800 : 500} ${Math.floor(VIEW_W * 0.034)}px sans-serif`;
+      ctx.font = `${isYou ? 800 : 500} ${Math.floor(VIEW_W * 0.034)}px ${FONT_BODY}`;
       ctx.textAlign = 'left';
       ctx.fillText(`${i + 1}. ${row.member}${isYou ? '  ← you' : ''}`, VIEW_W * 0.14, y);
       ctx.textAlign = 'right';
@@ -2401,12 +2571,12 @@ function drawGameOver(now: number): void {
   roundRect(btnX, btnY, btnW, btnH, 14);
   ctx.stroke();
   ctx.fillStyle = COLORS.hud;
-  ctx.font = `700 ${Math.floor(btnH * 0.42)}px sans-serif`;
-  ctx.fillText('⛵ PRACTICE AGAIN', VIEW_W / 2, btnY + btnH / 2);
+  ctx.font = `700 ${Math.floor(btnH * 0.28)}px ${FONT_TITLE}`;
+  ctx.fillText('PRACTICE AGAIN', VIEW_W / 2, btnY + btnH / 2);
   state.hitboxes.push({ id: 'again', x: btnX, y: btnY, w: btnW, h: btnH });
 
   ctx.fillStyle = COLORS.hudDim;
-  ctx.font = `600 ${Math.floor(VIEW_W * 0.032)}px sans-serif`;
+  ctx.font = `600 ${Math.floor(VIEW_W * 0.032)}px ${FONT_BODY}`;
   ctx.fillText(`⏱ next ship sails in ${nextShipCountdown()}`, VIEW_W / 2, btnY + btnH + VIEW_H * 0.045);
 }
 
@@ -2460,3 +2630,4 @@ function wrapText(text: string, cx: number, cy: number, maxW: number, lineH: num
   }
   if (line) ctx.fillText(line, cx, y);
 }
+
